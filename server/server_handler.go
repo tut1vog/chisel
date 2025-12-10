@@ -2,10 +2,11 @@ package chserver
 
 import (
 	"context"
+	"crypto/rand"
+    "encoding/hex"
 	"io"
 	"net"
 	"net/http"
-	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -87,8 +88,14 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 // handelSSE is responsible for handling the sse handshake
 func (s *Server) handleSSEGet(w http.ResponseWriter, req *http.Request) {
 	id := atomic.AddInt32(&s.sessCount, 1)
-	key := strconv.Itoa(int(id))
 	l := s.Fork("session#%d", id)
+	// Generate a secure random ID
+    key, err := generateSessionID()
+    if err != nil {
+        s.Debugf("Failed to generate session Key: %s", err)
+        w.WriteHeader(http.StatusInternalServerError)
+        return
+    }
 	pr, pw := io.Pipe()
 	s.sseSessions.Store(key, pw)
 	defer s.sseSessions.Delete(key)
@@ -104,22 +111,26 @@ func (s *Server) handleSSEGet(w http.ResponseWriter, req *http.Request) {
 func (s *Server) handleSSEPost(w http.ResponseWriter, req *http.Request) {
 	bodyBytes, err := io.ReadAll(req.Body)
 	if err != nil {
+		s.Debugf("Read client data failed")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 	defer req.Body.Close()
-	key := req.Header.Get("X-Chisel-Session-Id")
-	val, ok := s.sseSessions.Load(key)
+	sseSid := req.Header.Get("X-Chisel-Session-Id")
+	val, ok := s.sseSessions.Load(sseSid)
 	if !ok {
+		s.Debugf("sseSid not found, client should reconnect")
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
 	pw, ok := val.(*io.PipeWriter)
 	if !ok {
+		s.Debugf("Unexpected error, type conversion failed")
 		w.WriteHeader(http.StatusInternalServerError)
 	}
 	_, err = pw.Write(bodyBytes)
 	if err != nil {
+		s.Debugf("Failed to write client data: %s", err.Error())
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -235,4 +246,13 @@ func (s *Server) buildSSHTunnel(conn net.Conn, reqCtx context.Context, l *cio.Lo
 	} else {
 		l.Debugf("Closed connection")
 	}
+}
+
+func generateSessionID() (string, error) {
+    b := make([]byte, 16) // 16 bytes = 128 bits of entropy
+    _, err := rand.Read(b)
+    if err != nil {
+        return "", err
+    }
+    return hex.EncodeToString(b), nil
 }

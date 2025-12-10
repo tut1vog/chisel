@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -24,7 +25,7 @@ func NewClientSSEConn(resp *http.Response, url, id string) net.Conn {
 		scanner: 	bufio.NewScanner(resp.Body),
 		url: 		url,
 		sessionID: 	id,
-		client: 	&http.Client{},
+		client: 	&http.Client{Timeout: 10 * time.Second}, // POST Timeout
 	}
 	return &c
 }
@@ -43,6 +44,7 @@ func (c *ClientSSEConn) Read(dst []byte) (int, error) {
     }
 	for c.scanner.Scan() {
         line := c.scanner.Text()
+		// skip newline until reach next data:
         if strings.HasPrefix(line, "data:") {
             payload := strings.TrimPrefix(line, "data:")
             data, err := base64.StdEncoding.DecodeString(payload)
@@ -77,7 +79,7 @@ func (c *ClientSSEConn) Write(b []byte) (int, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return n, nil
+		return n, fmt.Errorf("unexpected status: %d", resp.StatusCode)
 	}
 	return n, nil
 }

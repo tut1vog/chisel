@@ -46,7 +46,7 @@ type Server struct {
 	sessions     *settings.Users
 	sshConfig    *ssh.ServerConfig
 	users        *settings.UserIndex
-	sseSessions  sync.Map
+	sseSessions  sync.Map // session id -> io.PipeWriter
 }
 
 var upgrader = websocket.Upgrader{

@@ -101,6 +101,7 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		}
 		conn = cnet.NewWebSocketConn(wsConn)
 	} else if c.config.Mode == "sse" {
+		// Derive SSE url from websocket url 
 		url := c.server
 		if strings.HasPrefix(url, "ws://") {
 			url = strings.Replace(url, "ws://", "http://", 1)
@@ -108,6 +109,7 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 			url = strings.Replace(url, "wss://", "https://", 1)
 		}
 		url += "/sse"
+		// Handshake Request
 		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
 			return false, err
@@ -120,11 +122,11 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		if resp.StatusCode != http.StatusOK {
 			return false, nil
 		}
-		sid := resp.Header.Get("X-Chisel-Session-Id")
-    	if sid == "" {
+		sseSid := resp.Header.Get("X-Chisel-Session-Id")
+    	if sseSid == "" {
         	return false, fmt.Errorf("missing session id")
 		}
-		conn = cnet.NewClientSSEConn(resp, url, sid)
+		conn = cnet.NewClientSSEConn(resp, url, sseSid)
     }
 
 	// perform SSH handshake on net.Conn
