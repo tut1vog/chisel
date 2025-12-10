@@ -43,6 +43,7 @@ type Config struct {
 	TLS              TLSConfig
 	DialContext      func(ctx context.Context, network, addr string) (net.Conn, error)
 	Verbose          bool
+	Mode 			 string
 }
 
 // TLSConfig for a Client

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"strings"
 	"time"
 
@@ -75,26 +77,56 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	//prepare dialer
-	d := websocket.Dialer{
-		HandshakeTimeout: settings.EnvDuration("WS_TIMEOUT", 45*time.Second),
-		Subprotocols:     []string{chshare.ProtocolVersion},
-		TLSClientConfig:  c.tlsConfig,
-		ReadBufferSize:   settings.EnvInt("WS_BUFF_SIZE", 0),
-		WriteBufferSize:  settings.EnvInt("WS_BUFF_SIZE", 0),
-		NetDialContext:   c.config.DialContext,
-	}
-	//optional proxy
-	if p := c.proxyURL; p != nil {
-		if err := c.setProxy(p, &d); err != nil {
+	
+	var conn net.Conn
+	if c.config.Mode == "websocket" {
+		//prepare dialer
+		d := websocket.Dialer{
+			HandshakeTimeout: settings.EnvDuration("WS_TIMEOUT", 45*time.Second),
+			Subprotocols:     []string{chshare.ProtocolVersion},
+			TLSClientConfig:  c.tlsConfig,
+			ReadBufferSize:   settings.EnvInt("WS_BUFF_SIZE", 0),
+			WriteBufferSize:  settings.EnvInt("WS_BUFF_SIZE", 0),
+			NetDialContext:   c.config.DialContext,
+		}
+		//optional proxy
+		if p := c.proxyURL; p != nil {
+			if err := c.setProxy(p, &d); err != nil {
+				return false, err
+			}
+		}
+		wsConn, _, err := d.DialContext(ctx, c.server, c.config.Headers)
+		if err != nil {
 			return false, err
 		}
-	}
-	wsConn, _, err := d.DialContext(ctx, c.server, c.config.Headers)
-	if err != nil {
-		return false, err
-	}
-	conn := cnet.NewWebSocketConn(wsConn)
+		conn = cnet.NewWebSocketConn(wsConn)
+	} else if c.config.Mode == "sse" {
+		url := c.server
+		if strings.HasPrefix(url, "ws://") {
+			url = strings.Replace(url, "ws://", "http://", 1)
+		} else if strings.HasPrefix(url, "wss://") {
+			url = strings.Replace(url, "wss://", "https://", 1)
+		}
+		url += "/sse"
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			return false, err
+		}
+		req.Header.Set("X-Chisel-Client-Version", chshare.ProtocolVersion)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return false, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return false, nil
+		}
+		sid := resp.Header.Get("X-Chisel-Session-Id")
+    	if sid == "" {
+        	return false, fmt.Errorf("missing session id")
+		}
+		conn = cnet.NewClientSSEConn(resp, url, sid)
+    }
+
 	// perform SSH handshake on net.Conn
 	c.Debugf("Handshaking...")
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, "", c.sshConfig)

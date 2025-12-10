@@ -439,6 +439,7 @@ func client(args []string) {
 	sni := flags.String("sni", "", "")
 	pid := flags.Bool("pid", false, "")
 	verbose := flags.Bool("v", false, "")
+	useSSE := flags.Bool("sse", false, "")
 	flags.Usage = func() {
 		fmt.Print(clientHelp)
 		os.Exit(0)
@@ -463,6 +464,11 @@ func client(args []string) {
 
 	if *sni != "" {
 		config.TLS.ServerName = *sni
+	}
+	if *useSSE {
+		config.Mode = "sse"
+	} else {
+		config.Mode = "websocket"
 	}
 
 	//ready

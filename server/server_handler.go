@@ -1,12 +1,17 @@
 package chserver
 
 import (
+	"context"
+	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	chshare "github.com/jpillora/chisel/share"
+	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
 	"github.com/jpillora/chisel/share/settings"
 	"github.com/jpillora/chisel/share/tunnel"
@@ -19,6 +24,9 @@ func (s *Server) handleClientHandler(w http.ResponseWriter, r *http.Request) {
 	//websockets upgrade AND has chisel prefix
 	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
 	protocol := r.Header.Get("Sec-WebSocket-Protocol")
+	if protocol == "" {
+		protocol = r.Header.Get("X-Chisel-Client-Version")
+	}
 	if upgrade == "websocket" {
 		if protocol == chshare.ProtocolVersion {
 			s.handleWebsocket(w, r)
@@ -31,6 +39,20 @@ func (s *Server) handleClientHandler(w http.ResponseWriter, r *http.Request) {
 	//proxy target was provided
 	if s.reverseProxy != nil {
 		s.reverseProxy.ServeHTTP(w, r)
+		return
+	}
+	if r.URL.Path == "/sse" {
+		if (strings.ToLower(r.Method) == "post") {
+			// tunneling, ignore protocol version
+			s.handleSSEPost(w, r)
+		} else if protocol != chshare.ProtocolVersion {
+			s.Infof("ignored client connection using protocol '%s', expected '%s'",
+				protocol, chshare.ProtocolVersion)
+			return
+		}
+		if strings.ToLower(r.Method) == "get" {
+			s.handleSSEGet(w, r)
+		}
 		return
 	}
 	//no proxy defined, provide access to health/version checks
@@ -59,6 +81,51 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 	conn := cnet.NewWebSocketConn(wsConn)
 	// perform SSH handshake on net.Conn
 	l.Debugf("Handshaking with %s...", req.RemoteAddr)
+	s.buildSSHTunnel(conn, req.Context(), l)
+}
+
+// handelSSE is responsible for handling the sse handshake
+func (s *Server) handleSSEGet(w http.ResponseWriter, req *http.Request) {
+	id := atomic.AddInt32(&s.sessCount, 1)
+	key := strconv.Itoa(int(id))
+	l := s.Fork("session#%d", id)
+	pr, pw := io.Pipe()
+	s.sseSessions.Store(key, pw)
+	defer s.sseSessions.Delete(key)
+	w.Header().Add("X-Chisel-Session-Id", key)
+	w.WriteHeader(http.StatusOK)
+	w.(http.Flusher).Flush()
+	conn := cnet.NewServerSSEConn(w, pr)
+	// perform SSH handshake on net.Conn
+	l.Debugf("Handshaking with %s...", req.RemoteAddr)
+	s.buildSSHTunnel(conn, req.Context(), l)
+}
+
+func (s *Server) handleSSEPost(w http.ResponseWriter, req *http.Request) {
+	bodyBytes, err := io.ReadAll(req.Body)
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	defer req.Body.Close()
+	key := req.Header.Get("X-Chisel-Session-Id")
+	val, ok := s.sseSessions.Load(key)
+	if !ok {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	pw, ok := val.(*io.PipeWriter)
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+	}
+	_, err = pw.Write(bodyBytes)
+	if err != nil {
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) buildSSHTunnel(conn net.Conn, reqCtx context.Context, l *cio.Logger) {
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, s.sshConfig)
 	if err != nil {
 		s.Debugf("Failed to handshake (%s)", err)
@@ -148,7 +215,7 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 	}
 	tunnel := tunnel.New(tunnelConfig)
 	//bind
-	eg, ctx := errgroup.WithContext(req.Context())
+	eg, ctx := errgroup.WithContext(reqCtx)
 	eg.Go(func() error {
 		//connected, handover ssh connection for tunnel to use, and block
 		return tunnel.BindSSH(ctx, sshConn, reqs, chans)
