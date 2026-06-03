@@ -36,7 +36,7 @@ func (c *ServerSSEConn) Write(b []byte) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	flusher, ok := c.w.(http.Flusher) 
+	flusher, ok := c.w.(http.Flusher)
 	if !ok {
 		return n, nil // data accepted but failed to flush
 	}

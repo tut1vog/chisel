@@ -15,7 +15,11 @@ test coverage for the SSE transport.
   in-package (precedent: `share/tunnel/wg_test.go`).
 
 ## Verification gate (run before every commit)
-- `gofmt -l .` → empty
+- `gofmt -l .` → no SSE-touched file listed (all SSE files are gofmt-clean).
+  Some pre-existing upstream files — e.g. `share/cnet/conn_rwc.go`,
+  `conn_ws.go`, `connstats.go`, `http_server.go`, `meter.go` — are flagged by
+  the go1.26 gofmt independently of this work and are intentionally left
+  untouched to keep the SSE diff focused.
 - `go vet ./...` → clean
 - `go build ./...` → ok
 - `go test ./...` → pass
@@ -25,81 +29,81 @@ test coverage for the SSE transport.
 ## Phase 0 — Planning artifacts
 - [x] Write `SSE_BUG_REPORT.md`
 - [x] Write `PLAN.md`
-- [ ] Commit both (`docs: add SSE review and remediation plan`)
+- [x] Commit both (`docs: add SSE review and remediation plan`)
 
 ## Phase 1 — Client crash fixes
 *Commit: `fix(client): prevent SSE handshake panics`*
-- [ ] **C2** — default empty/unknown `Mode` to `"websocket"`; return an explicit error for
+- [x] **C2** — default empty/unknown `Mode` to `"websocket"`; return an explicit error for
   an unknown mode instead of passing a nil `conn` to `ssh.NewClientConn`.
   `client/client_connect.go:81-130`, optionally normalize in `NewClient`
   (`client/client.go`).
-- [ ] **C1** — on non-200 SSE handshake, return a real error (`fmt.Errorf("sse handshake
+- [x] **C1** — on non-200 SSE handshake, return a real error (`fmt.Errorf("sse handshake
   failed: status %d", …)`) and close `resp.Body`; add a nil-guard before `err.Error()` in
   `connectionLoop`. `client/client_connect.go:35,122-124`.
-- [ ] *Acceptance:* existing `client` + `test/e2e` suites stop panicking and pass again
+- [x] *Acceptance:* existing `client` + `test/e2e` suites stop panicking and pass again
   (this alone fixes the currently-failing suite, incl. upstream `acl_channel_test.go`).
 
 ## Phase 2 — Client transport fidelity & conn lifecycle
 *Commit: `fix(client): honor TLS/proxy/dialer in SSE and fix conn lifecycle`*
-- [ ] **H3** — build one shared `*http.Client` whose `Transport` carries `c.tlsConfig`,
+- [x] **H3** — build one shared `*http.Client` whose `Transport` carries `c.tlsConfig`,
   `c.proxyURL`, and `c.config.DialContext`; apply `c.config.Headers`. Use it for the
   handshake GET and reuse it inside `ClientSSEConn` for POSTs.
   `client/client_connect.go:113-129`, `share/cnet/conn_client_sse.go:28,70-76`.
-- [ ] **C3** — retain `resp.Body` (and a request `context.CancelFunc`) in `ClientSSEConn`;
+- [x] **C3** — retain `resp.Body` (and a request `context.CancelFunc`) in `ClientSSEConn`;
   `Close()` cancels the GET context and closes the body.
   `share/cnet/conn_client_sse.go:23-31,87-89`.
-- [ ] **M2** — use `http.NewRequestWithContext` for GET and POST; thread the connection ctx.
-- [ ] **M3** — raise the read buffer: `scanner.Buffer(make([]byte,0,64*1024), maxFrame)`
+- [x] **M2** — use `http.NewRequestWithContext` for GET and POST; thread the connection ctx.
+- [x] **M3** — raise the read buffer: `scanner.Buffer(make([]byte,0,64*1024), maxFrame)`
   sized to the SSH max packet (base64-inflated). `share/cnet/conn_client_sse.go:25`.
-- [ ] **M4** — `defer resp.Body.Close()` immediately after a successful `Do`, before status
+- [x] **M4** — `defer resp.Body.Close()` immediately after a successful `Do`, before status
   checks. `client/client_connect.go:122-128`.
-- [ ] **M5** — replace the fixed `10*time.Second` POST timeout with a context-derived one;
+- [x] **M5** — replace the fixed `10*time.Second` POST timeout with a context-derived one;
   add a code comment documenting the one-round-trip-per-frame throughput limit.
   `share/cnet/conn_client_sse.go:28`.
-- [ ] **H4 (client half)** — set `Accept: text/event-stream` on the GET.
-- [ ] **L2** — derive the `/sse` URL with `net/url` join so a base path / trailing slash
+- [x] **H4 (client half)** — set `Accept: text/event-stream` on the GET.
+- [x] **L2** — derive the `/sse` URL with `net/url` join so a base path / trailing slash
   doesn't produce `//sse`. `client/client_connect.go:111`.
-- [ ] **L3** — `ClientSSEConn.Write` returns `n < len(b)` on error (io.Writer contract).
+- [x] **L3** — `ClientSSEConn.Write` returns `n < len(b)` on error (io.Writer contract).
   `share/cnet/conn_client_sse.go:81-83`.
 
 ## Phase 3 — Server lifecycle, routing & headers
 *Commit: `fix(server): SSE session lifecycle, routing, and stream headers`*
-- [ ] **H2** — tie session cleanup to `req.Context().Done()`; close the pipe writer/reader
+- [x] **H2** — tie session cleanup to `req.Context().Done()`; close the pipe writer/reader
   on disconnect so the SSH read always unblocks. `server/server_handler.go:89-109`.
-- [ ] **M6** — `defer conn.Close()` in the GET handler / `buildSSHTunnel` so handshake
+- [x] **M6** — `defer conn.Close()` in the GET handler / `buildSSHTunnel` so handshake
   failures don't abandon the pipe. `server/server_handler.go:89-109,139-144`.
-- [ ] **H1** — add the missing `return` after the failed type assertion in `handleSSEPost`.
+- [x] **H1** — add the missing `return` after the failed type assertion in `handleSSEPost`.
   `server/server_handler.go:126-130`.
-- [ ] **H4 (server half)** — set `Content-Type: text/event-stream`, `Cache-Control:
+- [x] **H4 (server half)** — set `Content-Type: text/event-stream`, `Cache-Control:
   no-cache`, `Connection: keep-alive`, `X-Accel-Buffering: no` on the GET response.
   `server/server_handler.go:102-104`.
-- [ ] **M1** — move the `/sse` routing above the `reverseProxy` block so `/sse` works with
+- [x] **M1** — move the `/sse` routing above the `reverseProxy` block so `/sse` works with
   `--backend`. `server/server_handler.go:40-58`.
-- [ ] **L1** — guard `w.(http.Flusher)` with comma-ok in `handleSSEGet`.
+- [x] **L1** — guard `w.(http.Flusher)` with comma-ok in `handleSSEGet`.
   `server/server_handler.go:104`.
-- [ ] **L6** — simplify the method/protocol gate (`switch r.Method`).
+- [x] **L6** — simplify the method/protocol gate (`switch r.Method`).
   `server/server_handler.go:45-58`.
-- [ ] **L7 (typo)** — fix "handelSSE" comment. `server/server_handler.go:88`.
+- [x] **L7 (typo)** — fix "handelSSE" comment. `server/server_handler.go:88`.
 
 ## Phase 4 — Tests (project convention)
 *Commit: `test: cover SSE transport`*
-- [ ] **E2E** `test/e2e/sse_test.go` (`package e2e_test`): SSE variants mirroring
+- [x] **E2E** `test/e2e/sse_test.go` (`package e2e_test`): SSE variants mirroring
   `base_test.go` / reverse / auth via `simpleSetup` + `client.Config{Mode:"sse"}`:
   `TestSSEBase`, `TestSSEReverse`, `TestSSEAuth`.
-- [ ] **E2E-TLS** SSE-over-TLS test reusing `cert_utils_test.go` / `tls_test.go` patterns —
+- [x] **E2E-TLS** SSE-over-TLS test reusing `cert_utils_test.go` / `tls_test.go` patterns —
   proves **H3** (TLS config honored). Gated on Phase 2.
-- [ ] **Unit** `share/cnet/conn_sse_test.go` (`package cnet`): base64 frame round-trip via a
+- [x] **Unit** `share/cnet/conn_sse_test.go` (`package cnet`): base64 frame round-trip via a
   pipe pair; short-`Read` `buff` leftover path; large frame > 64 KB (**M3** regression);
   malformed `data:` line; clean-EOF → `io.EOF`.
-- [ ] **Regression** client non-200 handshake (**C1**) against an `httptest.Server` returning
+- [x] **Regression** client non-200 handshake (**C1**) against an `httptest.Server` returning
   a non-200 on `/sse` → asserts a returned error and **no panic**. (**C2** is covered by the
   existing e2e suite, which sets no `Mode`.)
-- [ ] *Acceptance:* `go test ./...` green, including the new SSE cases.
+- [x] *Acceptance:* `go test ./...` green, including the new SSE cases.
 
 ## Phase 5 — Docs & formatting
 *Commit: `docs: document --sse flag; gofmt`*
-- [ ] **L5** — add `--sse` to `clientHelp` in `main.go` and a short note in `README.md`.
-- [ ] **L4** — `gofmt -w` the SSE files (mixed tabs/spaces, trailing newlines).
+- [x] **L5** — add `--sse` to `clientHelp` in `main.go` and a short note in `README.md`.
+- [x] **L4** — `gofmt -w` the SSE files (mixed tabs/spaces, trailing newlines).
 
 ---
 
