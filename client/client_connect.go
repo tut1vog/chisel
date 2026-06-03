@@ -7,6 +7,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"path"
 	"strings"
 	"time"
 
@@ -102,34 +104,58 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		}
 		conn = cnet.NewWebSocketConn(wsConn)
 	case "sse":
-		// Derive SSE url from websocket url
-		url := c.server
-		if strings.HasPrefix(url, "ws://") {
-			url = strings.Replace(url, "ws://", "http://", 1)
-		} else if strings.HasPrefix(url, "wss://") {
-			url = strings.Replace(url, "wss://", "https://", 1)
-		}
-		url += "/sse"
-		// Handshake Request
-		req, err := http.NewRequest("GET", url, nil)
+		// Derive the SSE URL from the (ws/wss) server URL, preserving any base
+		// path or trailing slash instead of naive string concatenation.
+		u, err := url.Parse(c.server)
 		if err != nil {
 			return false, err
 		}
-		req.Header.Set("X-Chisel-Client-Version", chshare.ProtocolVersion)
-		resp, err := http.DefaultClient.Do(req)
+		switch u.Scheme {
+		case "ws":
+			u.Scheme = "http"
+		case "wss":
+			u.Scheme = "https"
+		}
+		u.Path = path.Join("/", u.Path, "sse")
+		sseURL := u.String()
+		// Build one HTTP client that honors TLS, proxy and dialer config; it is
+		// shared by the handshake GET and every subsequent data POST.
+		transport := &http.Transport{
+			TLSClientConfig: c.tlsConfig,
+			DialContext:     c.config.DialContext,
+		}
+		if c.proxyURL != nil {
+			transport.Proxy = http.ProxyURL(c.proxyURL)
+		}
+		httpClient := &http.Client{Transport: transport}
+		// The streaming GET lives for the whole session; give it a cancelable
+		// context so Close (via the SSH conn) can abort the in-flight request.
+		sseCtx, sseCancel := context.WithCancel(ctx)
+		req, err := http.NewRequestWithContext(sseCtx, "GET", sseURL, nil)
 		if err != nil {
+			sseCancel()
+			return false, err
+		}
+		applySSEHeaders(req, c.config.Headers)
+		req.Header.Set("X-Chisel-Client-Version", chshare.ProtocolVersion)
+		req.Header.Set("Accept", "text/event-stream")
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			sseCancel()
 			return false, err
 		}
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
+			sseCancel()
 			return false, fmt.Errorf("sse handshake failed: status %d", resp.StatusCode)
 		}
 		sseSid := resp.Header.Get("X-Chisel-Session-Id")
 		if sseSid == "" {
 			resp.Body.Close()
+			sseCancel()
 			return false, fmt.Errorf("sse handshake failed: missing session id")
 		}
-		conn = cnet.NewClientSSEConn(resp, url, sseSid)
+		conn = cnet.NewClientSSEConn(sseCtx, sseCancel, resp, httpClient, c.config.Headers, sseURL, sseSid)
 	default:
 		return false, fmt.Errorf("unknown transport mode: %q", c.config.Mode)
 	}
@@ -170,4 +196,21 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 	c.Infof("Disconnected")
 	connected = time.Since(t0) > 5*time.Second
 	return connected, err
+}
+
+// applySSEHeaders replays the client-configured headers onto the handshake GET,
+// translating Host into the request's Host field (net/http ignores a "Host"
+// header key otherwise).
+func applySSEHeaders(req *http.Request, headers http.Header) {
+	for k, vs := range headers {
+		if strings.EqualFold(k, "Host") {
+			if len(vs) > 0 {
+				req.Host = vs[0]
+			}
+			continue
+		}
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
 }
