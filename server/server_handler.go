@@ -3,7 +3,7 @@ package chserver
 import (
 	"context"
 	"crypto/rand"
-    "encoding/hex"
+	"encoding/hex"
 	"io"
 	"net"
 	"net/http"
@@ -37,23 +37,28 @@ func (s *Server) handleClientHandler(w http.ResponseWriter, r *http.Request) {
 		s.Infof("ignored client connection using protocol '%s', expected '%s'",
 			protocol, chshare.ProtocolVersion)
 	}
+	//sse transport (handled before the reverse proxy so it also works with --backend)
+	if r.URL.Path == "/sse" {
+		switch r.Method {
+		case http.MethodPost:
+			//data frame upload; the session was already validated at handshake
+			s.handleSSEPost(w, r)
+		case http.MethodGet:
+			if protocol != chshare.ProtocolVersion {
+				s.Infof("ignored client connection using protocol '%s', expected '%s'",
+					protocol, chshare.ProtocolVersion)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			s.handleSSEGet(w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+		return
+	}
 	//proxy target was provided
 	if s.reverseProxy != nil {
 		s.reverseProxy.ServeHTTP(w, r)
-		return
-	}
-	if r.URL.Path == "/sse" {
-		if (strings.ToLower(r.Method) == "post") {
-			// tunneling, ignore protocol version
-			s.handleSSEPost(w, r)
-		} else if protocol != chshare.ProtocolVersion {
-			s.Infof("ignored client connection using protocol '%s', expected '%s'",
-				protocol, chshare.ProtocolVersion)
-			return
-		}
-		if strings.ToLower(r.Method) == "get" {
-			s.handleSSEGet(w, r)
-		}
 		return
 	}
 	//no proxy defined, provide access to health/version checks
@@ -85,24 +90,46 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 	s.buildSSHTunnel(conn, req.Context(), l)
 }
 
-// handelSSE is responsible for handling the sse handshake
+// handleSSEGet is responsible for handling the sse handshake and the long-lived
+// server->client stream.
 func (s *Server) handleSSEGet(w http.ResponseWriter, req *http.Request) {
 	id := atomic.AddInt32(&s.sessCount, 1)
 	l := s.Fork("session#%d", id)
 	// Generate a secure random ID
-    key, err := generateSessionID()
-    if err != nil {
-        s.Debugf("Failed to generate session Key: %s", err)
-        w.WriteHeader(http.StatusInternalServerError)
-        return
-    }
+	key, err := generateSessionID()
+	if err != nil {
+		s.Debugf("Failed to generate session Key: %s", err)
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 	pr, pw := io.Pipe()
 	s.sseSessions.Store(key, pw)
 	defer s.sseSessions.Delete(key)
-	w.Header().Add("X-Chisel-Session-Id", key)
+	// SSE/streaming response headers so intermediary proxies/CDNs don't buffer
+	// or transform the downstream channel.
+	h := w.Header()
+	h.Set("Content-Type", "text/event-stream")
+	h.Set("Cache-Control", "no-cache")
+	h.Set("Connection", "keep-alive")
+	h.Set("X-Accel-Buffering", "no")
+	h.Set("X-Chisel-Session-Id", key)
 	w.WriteHeader(http.StatusOK)
-	w.(http.Flusher).Flush()
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
 	conn := cnet.NewServerSSEConn(w, pr)
+	// Always unblock the SSH read side: close the conn (pipe reader) and the
+	// pipe writer when this handler returns, even on a handshake failure.
+	defer conn.Close()
+	defer pw.Close()
+	// Tie cleanup to client disconnect. Without this, a silently-vanished client
+	// leaves the SSH read loop blocked on the pipe, leaking the goroutine, pipe
+	// and session until (and unless) a keepalive write happens to fail.
+	go func() {
+		<-req.Context().Done()
+		pw.Close()
+		conn.Close()
+	}()
 	// perform SSH handshake on net.Conn
 	l.Debugf("Handshaking with %s...", req.RemoteAddr)
 	s.buildSSHTunnel(conn, req.Context(), l)
@@ -127,10 +154,13 @@ func (s *Server) handleSSEPost(w http.ResponseWriter, req *http.Request) {
 	if !ok {
 		s.Debugf("Unexpected error, type conversion failed")
 		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
 	_, err = pw.Write(bodyBytes)
 	if err != nil {
 		s.Debugf("Failed to write client data: %s", err.Error())
+		//the session's read side is gone; tell the client to reconnect
+		w.WriteHeader(http.StatusGone)
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -249,10 +279,10 @@ func (s *Server) buildSSHTunnel(conn net.Conn, reqCtx context.Context, l *cio.Lo
 }
 
 func generateSessionID() (string, error) {
-    b := make([]byte, 16) // 16 bytes = 128 bits of entropy
-    _, err := rand.Read(b)
-    if err != nil {
-        return "", err
-    }
-    return hex.EncodeToString(b), nil
+	b := make([]byte, 16) // 16 bytes = 128 bits of entropy
+	_, err := rand.Read(b)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
