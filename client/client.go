@@ -43,7 +43,7 @@ type Config struct {
 	TLS              TLSConfig
 	DialContext      func(ctx context.Context, network, addr string) (net.Conn, error)
 	Verbose          bool
-	Mode 			 string // websocket or sse
+	Mode             string // websocket or sse
 }
 
 // TLSConfig for a Client
@@ -78,6 +78,13 @@ func NewClient(c *Config) (*Client, error) {
 	}
 	if c.MaxRetryInterval < time.Second {
 		c.MaxRetryInterval = 5 * time.Minute
+	}
+	//default transport mode
+	if c.Mode == "" {
+		c.Mode = "websocket"
+	}
+	if c.Mode != "websocket" && c.Mode != "sse" {
+		return nil, fmt.Errorf("Invalid mode '%s' (expected 'websocket' or 'sse')", c.Mode)
 	}
 	u, err := url.Parse(c.Server)
 	if err != nil {

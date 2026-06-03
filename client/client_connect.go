@@ -32,7 +32,7 @@ func (c *Client) connectionLoop(ctx context.Context) error {
 		attempt := int(b.Attempt())
 		maxAttempt := c.config.MaxRetryCount
 		//dont print closed-connection errors
-		if strings.HasSuffix(err.Error(), "use of closed network connection") {
+		if err != nil && strings.HasSuffix(err.Error(), "use of closed network connection") {
 			err = io.EOF
 		}
 		//show error message and attempt counts (excluding disconnects)
@@ -77,9 +77,10 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	
+
 	var conn net.Conn
-	if c.config.Mode == "websocket" {
+	switch c.config.Mode {
+	case "websocket":
 		//prepare dialer
 		d := websocket.Dialer{
 			HandshakeTimeout: settings.EnvDuration("WS_TIMEOUT", 45*time.Second),
@@ -100,8 +101,8 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 			return false, err
 		}
 		conn = cnet.NewWebSocketConn(wsConn)
-	} else if c.config.Mode == "sse" {
-		// Derive SSE url from websocket url 
+	case "sse":
+		// Derive SSE url from websocket url
 		url := c.server
 		if strings.HasPrefix(url, "ws://") {
 			url = strings.Replace(url, "ws://", "http://", 1)
@@ -120,14 +121,18 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 			return false, err
 		}
 		if resp.StatusCode != http.StatusOK {
-			return false, nil
+			resp.Body.Close()
+			return false, fmt.Errorf("sse handshake failed: status %d", resp.StatusCode)
 		}
 		sseSid := resp.Header.Get("X-Chisel-Session-Id")
-    	if sseSid == "" {
-        	return false, fmt.Errorf("missing session id")
+		if sseSid == "" {
+			resp.Body.Close()
+			return false, fmt.Errorf("sse handshake failed: missing session id")
 		}
 		conn = cnet.NewClientSSEConn(resp, url, sseSid)
-    }
+	default:
+		return false, fmt.Errorf("unknown transport mode: %q", c.config.Mode)
+	}
 
 	// perform SSH handshake on net.Conn
 	c.Debugf("Handshaking...")
