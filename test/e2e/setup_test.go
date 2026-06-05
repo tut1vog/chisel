@@ -14,7 +14,7 @@ import (
 	chserver "github.com/jpillora/chisel/server"
 )
 
-const debug = true
+var debug = true
 
 // test layout configuration
 type testLayout struct {
@@ -25,7 +25,7 @@ type testLayout struct {
 	udpServer  bool
 }
 
-func (tl *testLayout) setup(t *testing.T) (server *chserver.Server, client *chclient.Client, teardown func()) {
+func (tl *testLayout) setup(tb testing.TB) (server *chserver.Server, client *chclient.Client, teardown func()) {
 	//start of the world
 	// goroutines := runtime.NumGoroutine()
 	//root cancel
@@ -42,7 +42,7 @@ func (tl *testLayout) setup(t *testing.T) (server *chserver.Server, client *chcl
 		}
 		fl, err := net.Listen("tcp", fileAddr)
 		if err != nil {
-			t.Fatal(err)
+			tb.Fatal(err)
 		}
 		log.Printf("fileserver: listening on %s", fileAddr)
 		go func() {
@@ -57,12 +57,12 @@ func (tl *testLayout) setup(t *testing.T) (server *chserver.Server, client *chcl
 	//server
 	server, err := chserver.NewServer(tl.server)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	server.Debug = debug
 	port := availablePort()
 	if err := server.StartContext(ctx, "127.0.0.1", port); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	go func() {
 		server.Wait()
@@ -85,11 +85,11 @@ func (tl *testLayout) setup(t *testing.T) (server *chserver.Server, client *chcl
 	}
 	client, err = chclient.NewClient(tl.client)
 	if err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	client.Debug = debug
 	if err := client.Start(ctx); err != nil {
-		t.Fatal(err)
+		tb.Fatal(err)
 	}
 	go func() {
 		client.Wait()
@@ -118,13 +118,13 @@ func (tl *testLayout) setup(t *testing.T) (server *chserver.Server, client *chcl
 	return server, client, teardown
 }
 
-func simpleSetup(t *testing.T, s *chserver.Config, c *chclient.Config) context.CancelFunc {
+func simpleSetup(tb testing.TB, s *chserver.Config, c *chclient.Config) context.CancelFunc {
 	conf := testLayout{
 		server:     s,
 		client:     c,
 		fileServer: true,
 	}
-	_, _, teardown := conf.setup(t)
+	_, _, teardown := conf.setup(tb)
 	return teardown
 }
 
@@ -133,6 +133,7 @@ func post(url, body string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	defer resp.Body.Close()
 	b, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", err
