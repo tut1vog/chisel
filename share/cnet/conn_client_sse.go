@@ -116,24 +116,38 @@ func (c *ClientSSEConn) Close() error {
 	return c.body.Close()
 }
 
+// LocalAddr and RemoteAddr return the conn itself as a placeholder net.Addr,
+// mirroring the stdio adapter (conn_rwc.go). The SSE transport spans many HTTP
+// requests with no single stable socket, so there is no real address to report —
+// and returning nil would panic any caller that logs RemoteAddr().String().
 func (c *ClientSSEConn) LocalAddr() net.Addr {
-	return nil
+	return c
 }
 
 func (c *ClientSSEConn) RemoteAddr() net.Addr {
-	return nil
+	return c
 }
 
+func (c *ClientSSEConn) Network() string {
+	return "tcp"
+}
+
+func (c *ClientSSEConn) String() string {
+	return ""
+}
+
+// Deadlines are intentionally no-ops: chisel drives liveness with SSH keepalive
+// rather than socket deadlines, the same as the stdio adapter (conn_rwc.go).
 func (c *ClientSSEConn) SetDeadline(t time.Time) error {
-	return nil
+	return nil //no-op
 }
 
 func (c *ClientSSEConn) SetReadDeadline(t time.Time) error {
-	return nil
+	return nil //no-op
 }
 
 func (c *ClientSSEConn) SetWriteDeadline(t time.Time) error {
-	return nil
+	return nil //no-op
 }
 
 // applyHeaders replays client-supplied headers onto an outbound request,
