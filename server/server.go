@@ -46,6 +46,7 @@ type Server struct {
 	sshConfig    *ssh.ServerConfig
 	users        *settings.UserIndex
 	sseSessions  sync.Map // session id -> io.PipeWriter
+	sseShutdown  chan struct{}
 }
 
 var upgrader = websocket.Upgrader{
@@ -57,11 +58,18 @@ var upgrader = websocket.Upgrader{
 // NewServer creates and returns a new chisel server
 func NewServer(c *Config) (*Server, error) {
 	server := &Server{
-		config:     c,
-		httpServer: cnet.NewHTTPServer(),
-		Logger:     cio.NewLogger("server"),
+		config:      c,
+		httpServer:  cnet.NewHTTPServer(),
+		Logger:      cio.NewLogger("server"),
+		sseShutdown: make(chan struct{}),
 	}
 	server.Info = true
+	//SSE streams are ordinary in-flight requests, so a graceful shutdown
+	//would wait out the whole grace period for them; end them up front
+	var sseShutdownOnce sync.Once
+	server.httpServer.RegisterOnShutdown(func() {
+		sseShutdownOnce.Do(func() { close(server.sseShutdown) })
+	})
 	server.users = settings.NewUserIndex(server.Logger)
 	//pin the --auth user first so authfile reloads cannot drop it
 	if c.Auth != "" {

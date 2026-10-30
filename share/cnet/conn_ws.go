@@ -32,6 +32,13 @@ func NewWebSocketConn(websocketConn *websocket.Conn) net.Conn {
 	return &c
 }
 
+// ConfiguredReadLimit is the maximum size of a single frame read from a peer
+// before SSH authentication (CHISEL_WS_READ_LIMIT, 0 disables). Despite the
+// variable name it applies to every transport, including SSE uploads.
+func ConfiguredReadLimit() int64 {
+	return configuredWebSocketReadLimit()
+}
+
 func configuredWebSocketReadLimit() int64 {
 	// Only 0 disables the limit. Treat negative values as invalid rather than
 	// letting gorilla interpret them as another unlimited setting.

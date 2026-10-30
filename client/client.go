@@ -295,11 +295,8 @@ func (c *Client) setProxy(u *url.URL, d *websocket.Dialer) error {
 	}
 	// SOCKS5 proxy. all variants behave identically: DNS is
 	// resolved by the proxy (golang.org/x/net/proxy.SOCKS5)
-	if u.Scheme != "socks" && u.Scheme != "socks5" && u.Scheme != "socks5h" {
-		return fmt.Errorf(
-			"unsupported socks proxy type: %s:// (only socks://, socks5:// or socks5h:// are supported)",
-			u.Scheme,
-		)
+	if err := checkSocksScheme(u.Scheme); err != nil {
+		return err
 	}
 	var auth *proxy.Auth
 	if u.User != nil {
@@ -314,6 +311,32 @@ func (c *Client) setProxy(u *url.URL, d *websocket.Dialer) error {
 		return err
 	}
 	d.NetDial = socksDialer.Dial
+	return nil
+}
+
+// sseProxyURL maps --proxy onto a URL net/http's Transport understands,
+// accepting the same schemes as setProxy. net/http only speaks SOCKS for
+// socks5:// and socks5h:// and treats anything else (including socks://)
+// as an HTTP CONNECT proxy, so every SOCKS variant becomes socks5h://.
+func sseProxyURL(u *url.URL) (*url.URL, error) {
+	if !strings.HasPrefix(u.Scheme, "socks") {
+		return u, nil
+	}
+	if err := checkSocksScheme(u.Scheme); err != nil {
+		return nil, err
+	}
+	p := *u
+	p.Scheme = "socks5h"
+	return &p, nil
+}
+
+func checkSocksScheme(scheme string) error {
+	if scheme != "socks" && scheme != "socks5" && scheme != "socks5h" {
+		return fmt.Errorf(
+			"unsupported socks proxy type: %s:// (only socks://, socks5:// or socks5h:// are supported)",
+			scheme,
+		)
+	}
 	return nil
 }
 

@@ -3,6 +3,7 @@ package chserver
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -126,7 +127,10 @@ func (s *Server) handleSSEGet(w http.ResponseWriter, req *http.Request) {
 	// leaves the SSH read loop blocked on the pipe, leaking the goroutine, pipe
 	// and session until (and unless) a keepalive write happens to fail.
 	go func() {
-		<-req.Context().Done()
+		select {
+		case <-req.Context().Done():
+		case <-s.sseShutdown:
+		}
 		pw.Close()
 		conn.Close()
 	}()
@@ -136,13 +140,9 @@ func (s *Server) handleSSEGet(w http.ResponseWriter, req *http.Request) {
 }
 
 func (s *Server) handleSSEPost(w http.ResponseWriter, req *http.Request) {
-	bodyBytes, err := io.ReadAll(req.Body)
-	if err != nil {
-		s.Debugf("Read client data failed")
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
 	defer req.Body.Close()
+	//resolve the session before reading anything, so unknown peers
+	//cannot make the server buffer a body at all
 	sseSid := req.Header.Get("X-Chisel-Session-Id")
 	val, ok := s.sseSessions.Load(sseSid)
 	if !ok {
@@ -153,6 +153,26 @@ func (s *Server) handleSSEPost(w http.ResponseWriter, req *http.Request) {
 	pw, ok := val.(*io.PipeWriter)
 	if !ok {
 		s.Debugf("Unexpected error, type conversion failed")
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	//a session is handed out before SSH authentication, so cap each
+	//frame like the websocket read limit does (pre-auth memory DoS)
+	body := io.Reader(req.Body)
+	if limit := cnet.ConfiguredReadLimit(); limit > 0 {
+		body = http.MaxBytesReader(w, req.Body, limit)
+	}
+	bodyBytes, err := io.ReadAll(body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			//mirror websocket: an oversized frame kills the session
+			s.Debugf("SSE frame exceeds read limit (%d bytes), closing session", maxErr.Limit)
+			pw.CloseWithError(err)
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			return
+		}
+		s.Debugf("Read client data failed")
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}

@@ -135,7 +135,11 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 			DialContext:     c.config.DialContext,
 		}
 		if c.proxyURL != nil {
-			transport.Proxy = http.ProxyURL(c.proxyURL)
+			p, err := sseProxyURL(c.proxyURL)
+			if err != nil {
+				return false, err
+			}
+			transport.Proxy = http.ProxyURL(p)
 		}
 		httpClient := &http.Client{Transport: transport}
 		// The streaming GET lives for the whole session; give it a cancelable
