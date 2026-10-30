@@ -4,30 +4,29 @@ import (
 	"time"
 )
 
-// The SSE transport is shaped like a streaming JSON API rather than a raw
-// byte pipe:
+// The SSE transport is shaped like a web app with a live event feed (a
+// browser EventSource) and JSON actions, rather than a raw byte pipe:
 //
-//	open:     POST <endpoint> {"stream":true}
-//	          -> 200 text/event-stream, first event data: {"id":"<session>"}
+//	open:     GET <endpoint>, Accept: text/event-stream
+//	          [Cookie: session=<token>]               (with --obfs-key)
+//	          -> 200 text/event-stream, Set-Cookie: session=<id>
 //	down:     data: {"content":"<base64>"}            (one event per <=2 KiB)
-//	up:       POST <endpoint> {"id":"<session>","content":"<base64>"}
+//	up:       POST <endpoint>, Cookie: session=<id>, {"content":"<base64>"}
 //	          -> 200 {"status":"ok"}
 //
+// Requests that fail these checks are served as ordinary web requests.
 // Client writes are batched: one upload is in flight at a time and whatever
 // accumulates meanwhile goes in the next request.
 
-// SSERequest is the JSON body of every client POST. Content is []byte, so
+// SSEUpload is the JSON body of every client upload. Content is []byte, so
 // encoding/json carries it as standard base64.
-type SSERequest struct {
-	ID      string `json:"id,omitempty"`
-	Stream  bool   `json:"stream,omitempty"`
-	Content []byte `json:"content,omitempty"`
+type SSEUpload struct {
+	Content []byte `json:"content"`
 }
 
 // sseEvent is the JSON payload of each server-sent "data:" line
 type sseEvent struct {
-	ID      string `json:"id,omitempty"`
-	Content []byte `json:"content,omitempty"`
+	Content []byte `json:"content"`
 }
 
 const (

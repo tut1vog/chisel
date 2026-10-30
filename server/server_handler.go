@@ -33,31 +33,59 @@ func (s *Server) ssePath() string {
 // handleClientHandler is the main http websocket handler for the chisel server
 func (s *Server) handleClientHandler(w http.ResponseWriter, r *http.Request) {
 	//tunnel requests carry no chisel-specific headers; they are recognised
-	//by path alone (any path for websockets when --path is unset)
+	//by path (any path for websockets when --path is unset) and, with
+	//--obfs-key, by a token cookie. Anything else is served like an
+	//ordinary request, so probing the server reveals no tunnel.
 	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
-	if upgrade == "websocket" && (s.config.Path == "" || r.URL.Path == s.config.Path) {
+	if upgrade == "websocket" && (s.config.Path == "" || r.URL.Path == s.config.Path) && s.tunnelAuthorized(r) {
 		s.handleWebsocket(w, r)
 		return
 	}
-	//sse transport (handled before the reverse proxy so it also works with
-	//--backend); other methods on the endpoint fall through like any request
-	if r.URL.Path == s.ssePath() && r.Method == http.MethodPost {
-		s.handleSSE(w, r)
-		return
+	//sse transport (handled before the reverse proxy so it also works with --backend)
+	if r.URL.Path == s.ssePath() {
+		switch r.Method {
+		case http.MethodGet:
+			if strings.Contains(r.Header.Get("Accept"), "text/event-stream") && s.tunnelAuthorized(r) {
+				s.handleSSEStream(w, r)
+				return
+			}
+		case http.MethodPost:
+			if s.handleSSEUpload(w, r) {
+				return
+			}
+		}
 	}
+	s.handleOrdinary(w, r)
+}
+
+// tunnelAuthorized reports whether a request may open a tunnel: always
+// without --obfs-key, otherwise only with a valid, unused token cookie.
+func (s *Server) tunnelAuthorized(r *http.Request) bool {
+	if s.tokens == nil {
+		return true
+	}
+	c, err := r.Cookie(cnet.SessionCookie)
+	return err == nil && s.tokens.Verify(c.Value)
+}
+
+// handleOrdinary serves requests that are not tunnel traffic
+func (s *Server) handleOrdinary(w http.ResponseWriter, r *http.Request) {
 	//proxy target was provided
 	if s.reverseProxy != nil {
 		s.reverseProxy.ServeHTTP(w, r)
 		return
 	}
-	//no proxy defined, provide access to health/version checks
-	switch r.URL.Path {
-	case "/health":
-		w.Write([]byte("OK\n"))
-		return
-	case "/version":
-		w.Write([]byte(chshare.BuildVersion))
-		return
+	//no proxy defined, provide access to health/version checks, unless
+	//the server is hiding (the version names this fork)
+	if s.obfsKey == nil {
+		switch r.URL.Path {
+		case "/health":
+			w.Write([]byte("OK\n"))
+			return
+		case "/version":
+			w.Write([]byte(chshare.BuildVersion))
+			return
+		}
 	}
 	//missing :O
 	w.WriteHeader(404)
@@ -77,37 +105,6 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 	// perform SSH handshake on net.Conn
 	l.Debugf("Handshaking with %s...", req.RemoteAddr)
 	s.buildSSHTunnel(conn, req, l)
-}
-
-// handleSSE reads a client POST and either opens a stream or delivers an
-// upload to an open one, depending on its body.
-func (s *Server) handleSSE(w http.ResponseWriter, req *http.Request) {
-	defer req.Body.Close()
-	//a session is handed out before SSH authentication, so cap each
-	//body like the websocket read limit does (pre-auth memory DoS)
-	body := io.Reader(req.Body)
-	if limit := cnet.ConfiguredReadLimit(); limit > 0 {
-		body = http.MaxBytesReader(w, req.Body, limit)
-	}
-	var msg cnet.SSERequest
-	if err := json.NewDecoder(body).Decode(&msg); err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			s.Debugf("SSE request exceeds read limit (%d bytes)", maxErr.Limit)
-			w.WriteHeader(http.StatusRequestEntityTooLarge)
-			return
-		}
-		w.WriteHeader(http.StatusBadRequest)
-		return
-	}
-	switch {
-	case msg.ID != "":
-		s.handleSSEUpload(w, msg)
-	case msg.Stream:
-		s.handleSSEStream(w, req)
-	default:
-		w.WriteHeader(http.StatusBadRequest)
-	}
 }
 
 // handleSSEStream is responsible for the sse handshake and the long-lived
@@ -132,11 +129,18 @@ func (s *Server) handleSSEStream(w http.ResponseWriter, req *http.Request) {
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
+	//uploads return the session id in this cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     cnet.SessionCookie,
+		Value:    key,
+		Path:     s.ssePath(),
+		HttpOnly: true,
+		Secure:   req.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+	})
 	w.WriteHeader(http.StatusOK)
-	//the session id is the stream's first event
-	if err := cnet.WriteSSESessionID(w, key); err != nil {
-		pw.Close()
-		return
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
 	}
 	conn := cnet.NewServerSSEConn(w, pr, cnet.NewPacer(s.sseRate))
 	// Always unblock the SSH read side: close the conn (pipe reader) and the
@@ -159,28 +163,53 @@ func (s *Server) handleSSEStream(w http.ResponseWriter, req *http.Request) {
 	s.buildSSHTunnel(conn, req, l)
 }
 
-// handleSSEUpload delivers an upload's content to its session's stream
-func (s *Server) handleSSEUpload(w http.ResponseWriter, msg cnet.SSERequest) {
-	val, ok := s.sseSessions.Load(msg.ID)
+// handleSSEUpload delivers an upload's content to its session's stream. It
+// returns false, having read nothing, when the request names no open
+// session, so the caller can serve it as an ordinary request.
+func (s *Server) handleSSEUpload(w http.ResponseWriter, req *http.Request) bool {
+	c, err := req.Cookie(cnet.SessionCookie)
+	if err != nil {
+		return false
+	}
+	val, ok := s.sseSessions.Load(c.Value)
 	if !ok {
-		s.Debugf("sse session not found, client should reconnect")
-		w.WriteHeader(http.StatusNotFound)
-		return
+		return false
 	}
 	pw, ok := val.(*io.PipeWriter)
 	if !ok {
 		s.Debugf("Unexpected error, type conversion failed")
 		w.WriteHeader(http.StatusInternalServerError)
-		return
+		return true
+	}
+	defer req.Body.Close()
+	//a session is handed out before SSH authentication, so cap each
+	//body like the websocket read limit does (pre-auth memory DoS)
+	body := io.Reader(req.Body)
+	if limit := cnet.ConfiguredReadLimit(); limit > 0 {
+		body = http.MaxBytesReader(w, req.Body, limit)
+	}
+	var msg cnet.SSEUpload
+	if err := json.NewDecoder(body).Decode(&msg); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			//mirror websocket: an oversized frame kills the session
+			s.Debugf("SSE frame exceeds read limit (%d bytes), closing session", maxErr.Limit)
+			pw.CloseWithError(err)
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			return true
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		return true
 	}
 	if _, err := pw.Write(msg.Content); err != nil {
 		s.Debugf("Failed to write client data: %s", err.Error())
 		//the session's read side is gone; tell the client to reconnect
 		w.WriteHeader(http.StatusGone)
-		return
+		return true
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write([]byte(cnet.SSEUploadOK))
+	return true
 }
 
 func (s *Server) buildSSHTunnel(conn net.Conn, req *http.Request, l *cio.Logger) {

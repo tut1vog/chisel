@@ -177,8 +177,9 @@ type uploadRecorder struct {
 }
 
 func (u *uploadRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	var msg SSERequest
-	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil || msg.ID != "sid" {
+	var msg SSEUpload
+	c, err := r.Cookie(SessionCookie)
+	if err != nil || c.Value != "sid" || json.NewDecoder(r.Body).Decode(&msg) != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
@@ -201,11 +202,8 @@ func (u *uploadRecorder) joined() ([]byte, int) {
 func newTestClientConn(t *testing.T, url string) net.Conn {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	resp := &http.Response{Body: io.NopCloser(strings.NewReader("data: {\"id\":\"sid\"}\n\n"))}
-	conn, err := NewClientSSEConn(ctx, cancel, resp, http.DefaultClient, http.Header{}, url, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader(""))}
+	conn := NewClientSSEConn(ctx, cancel, resp, http.DefaultClient, http.Header{}, url, "sid", 0)
 	t.Cleanup(func() { conn.Close() })
 	return conn
 }
@@ -240,9 +238,21 @@ func TestSSEClientBatchesWrites(t *testing.T) {
 }
 
 func TestSSEClientWriteFailsAfterUploadError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	}))
+	for name, handler := range map[string]http.HandlerFunc{
+		"error status": func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+		},
+		//an unknown session reaches --backend, which may answer 200
+		"unacknowledged 200": func(w http.ResponseWriter, r *http.Request) {
+			w.Write([]byte("<html>welcome</html>"))
+		},
+	} {
+		t.Run(name, func(t *testing.T) { testUploadFailure(t, handler) })
+	}
+}
+
+func testUploadFailure(t *testing.T, handler http.Handler) {
+	srv := httptest.NewServer(handler)
 	defer srv.Close()
 	conn := newTestClientConn(t, srv.URL)
 	conn.Write([]byte("hello"))

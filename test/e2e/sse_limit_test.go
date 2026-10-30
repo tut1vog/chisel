@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -31,10 +32,15 @@ func startSSEServer(t *testing.T, seed string) (s *chserver.Server, base string)
 }
 
 // openSSESession performs the unauthenticated SSE handshake, returning the
-// session id (the stream's first event) and the still-open event stream.
+// session id (from its cookie) and the still-open event stream.
 func openSSESession(t *testing.T, url string) (string, *bufio.Reader, *http.Response) {
 	t.Helper()
-	resp, err := http.Post(url, "application/json", strings.NewReader(`{"stream":true}`))
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,74 +48,102 @@ func openSSESession(t *testing.T, url string) (string, *bufio.Reader, *http.Resp
 		resp.Body.Close()
 		t.Fatalf("handshake status %d", resp.StatusCode)
 	}
-	r := bufio.NewReader(resp.Body)
-	line, err := r.ReadString('\n')
-	var ev struct{ ID string }
-	if err != nil || json.Unmarshal([]byte(strings.TrimPrefix(line, "data:")), &ev) != nil || ev.ID == "" {
-		resp.Body.Close()
-		t.Fatalf("missing session id event, got %q (%v)", line, err)
+	var sid string
+	for _, c := range resp.Cookies() {
+		if c.Name == cnet.SessionCookie {
+			sid = c.Value
+		}
 	}
-	return ev.ID, r, resp
+	if sid == "" {
+		resp.Body.Close()
+		t.Fatal("missing session cookie")
+	}
+	return sid, bufio.NewReader(resp.Body), resp
 }
 
-func postSSE(t *testing.T, url string, body []byte) int {
+// postSSE uploads body under session sid ("" sends no cookie)
+func postSSE(t *testing.T, url, sid string, body []byte) (int, string) {
 	t.Helper()
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if sid != "" {
+		req.AddCookie(&http.Cookie{Name: cnet.SessionCookie, Value: sid})
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		//the server may reset the upload once the limit is hit
-		return 0
+		return 0, ""
 	}
-	resp.Body.Close()
-	return resp.StatusCode
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
 }
 
-func uploadBody(t *testing.T, sid string, content []byte) []byte {
+func uploadBody(t *testing.T, content []byte) []byte {
 	t.Helper()
-	b, err := json.Marshal(cnet.SSERequest{ID: sid, Content: content})
+	b, err := json.Marshal(cnet.SSEUpload{Content: content})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return b
 }
 
-// TestSSEPostUnknownSession verifies that uploads without a valid session,
-// and requests that are neither uploads nor stream opens, are rejected.
+// waitStreamEnd drains an SSE stream and fails unless it ends within 5s.
+func waitStreamEnd(t *testing.T, r io.Reader, what string) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		io.Copy(io.Discard, r)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("SSE stream still open 5s after %s", what)
+	}
+}
+
+// TestSSEPostUnknownSession verifies that uploads without an open session
+// are served as ordinary requests (here the default 404), and malformed
+// uploads to an open session are rejected.
 func TestSSEPostUnknownSession(t *testing.T) {
 	s, url := startSSEServer(t, "sse-unknown-session")
 	defer s.Close()
-	if code := postSSE(t, url, uploadBody(t, "not-a-session", []byte("hello"))); code != http.StatusNotFound {
-		t.Fatalf("unknown session: expected 404, got %d", code)
-	}
-	for _, body := range []string{`{"content":"aGVsbG8="}`, `not json`, `{}`} {
-		if code := postSSE(t, url, []byte(body)); code != http.StatusBadRequest {
-			t.Fatalf("%s: expected 400, got %d", body, code)
+	for _, sid := range []string{"", "not-a-session"} {
+		code, body := postSSE(t, url, sid, uploadBody(t, []byte("hello")))
+		if code != http.StatusNotFound || body != "Not found" {
+			t.Fatalf("session %q: expected the ordinary 404, got %d %q", sid, code, body)
 		}
+	}
+	sid, _, stream := openSSESession(t, url)
+	defer stream.Body.Close()
+	if code, _ := postSSE(t, url, sid, []byte("not json")); code != http.StatusBadRequest {
+		t.Fatalf("malformed upload: expected 400, got %d", code)
 	}
 }
 
 // TestSSEPreAuthOversizedFrame is the SSE counterpart of
 // TestPreAuthOversizedMessage: an unauthenticated peer's oversized upload
-// must be refused before it is buffered. (The session id lives inside the
-// body, so a truncated body cannot name the session to end; the client
-// reconnects on the 413 instead.)
+// must be refused and must end its session.
 func TestSSEPreAuthOversizedFrame(t *testing.T) {
 	t.Setenv("CHISEL_WS_READ_LIMIT", "")
 	s, url := startSSEServer(t, "sse-limit-test")
 	defer s.Close()
 	sid, events, stream := openSSESession(t, url)
 	defer stream.Body.Close()
-	//the server's SSH identification arrives next
+	//the server's SSH identification arrives first
 	line, err := events.ReadString('\n')
-	for err == nil && strings.TrimSpace(line) == "" {
-		line, err = events.ReadString('\n')
-	}
 	if err != nil || !strings.HasPrefix(line, "data:") {
 		t.Fatalf("expected SSH identification event, got %q (%v)", line, err)
 	}
-	oversized := uploadBody(t, sid, bytes.Repeat([]byte("A"), 512*1024))
-	if code := postSSE(t, url, oversized); code != http.StatusRequestEntityTooLarge && code != 0 {
+	oversized := uploadBody(t, bytes.Repeat([]byte("A"), 512*1024))
+	if code, _ := postSSE(t, url, sid, oversized); code != http.StatusRequestEntityTooLarge && code != 0 {
 		t.Fatalf("expected 413 for oversized frame, got %d", code)
 	}
+	waitStreamEnd(t, events, "oversized frame")
 }
 
 // TestSSEShutdownEndsStreams verifies that a graceful shutdown ends SSE

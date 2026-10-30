@@ -37,17 +37,6 @@ func writeSSEEvent(w io.Writer, ev sseEvent) error {
 	return err
 }
 
-// WriteSSESessionID sends the session id as the stream's first event
-func WriteSSESessionID(w http.ResponseWriter, id string) error {
-	if err := writeSSEEvent(w, sseEvent{ID: id}); err != nil {
-		return err
-	}
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-	return nil
-}
-
 func (c *ServerSSEConn) Read(dst []byte) (int, error) {
 	// directly read from pipe
 	return c.p.Read(dst)

@@ -44,31 +44,27 @@ type ClientSSEConn struct {
 	err     error  // set once the sender stops; returned by later Writes
 }
 
-// NewClientSSEConn wraps the streaming handshake response as a net.Conn,
-// reading the session id from its first event. ctx governs the lifetime of
-// uploads and cancel is invoked by Close to abort the streaming response.
-// rate limits upload bytes per second (0 is unlimited).
-func NewClientSSEConn(ctx context.Context, cancel context.CancelFunc, resp *http.Response, client *http.Client, headers http.Header, url string, rate int64) (net.Conn, error) {
+// NewClientSSEConn wraps the streaming handshake response as a net.Conn.
+// sessionID comes from the response's session cookie. ctx governs the
+// lifetime of uploads and cancel is invoked by Close to abort the streaming
+// response. rate limits upload bytes per second (0 is unlimited).
+func NewClientSSEConn(ctx context.Context, cancel context.CancelFunc, resp *http.Response, client *http.Client, headers http.Header, url, sessionID string, rate int64) net.Conn {
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxSSEFrame)
 	c := &ClientSSEConn{
-		client:  client,
-		url:     url,
-		headers: headers,
-		ctx:     ctx,
-		cancel:  cancel,
-		body:    resp.Body,
-		scanner: scanner,
-		pacer:   NewPacer(rate),
+		sessionID: sessionID,
+		client:    client,
+		url:       url,
+		headers:   headers,
+		ctx:       ctx,
+		cancel:    cancel,
+		body:      resp.Body,
+		scanner:   scanner,
+		pacer:     NewPacer(rate),
 	}
 	c.cond = sync.NewCond(&c.mu)
-	ev, err := c.nextEvent()
-	if err != nil || ev.ID == "" {
-		return nil, fmt.Errorf("sse handshake failed: missing session id")
-	}
-	c.sessionID = ev.ID
 	go c.sendLoop()
-	return c, nil
+	return c
 }
 
 // nextEvent returns the next "data:" event of the stream
@@ -145,7 +141,7 @@ func (c *ClientSSEConn) sendLoop() {
 }
 
 func (c *ClientSSEConn) upload(b []byte) error {
-	body, err := json.Marshal(SSERequest{ID: c.sessionID, Content: b})
+	body, err := json.Marshal(SSEUpload{Content: b})
 	if err != nil {
 		return err
 	}
@@ -156,15 +152,21 @@ func (c *ClientSSEConn) upload(b []byte) error {
 	applyHeaders(req, c.headers)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	req.AddCookie(&http.Cookie{Name: SessionCookie, Value: c.sessionID})
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return err
 	}
-	//drain so the keep-alive connection is reused
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	//read (and so drain, for keep-alive reuse) the acknowledgement
+	ack, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+	//an unknown session is served like any web request, which may well
+	//be a 200 from --backend; only the acknowledgement means delivered
+	if string(ack) != SSEUploadOK {
+		return fmt.Errorf("upload not acknowledged")
 	}
 	return nil
 }

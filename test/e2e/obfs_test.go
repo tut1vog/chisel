@@ -96,3 +96,60 @@ func TestObfsKeyMismatch(t *testing.T) {
 		}
 	}
 }
+
+// TestObfsKeyWithAuth checks that --auth still gates tunnels under
+// --obfs-key: the right credentials carry traffic, wrong ones are refused.
+func TestObfsKeyWithAuth(t *testing.T) {
+	for _, mode := range []string{"websocket", "sse"} {
+		t.Run(mode, func(t *testing.T) {
+			tmpPort := availablePort()
+			teardown := simpleSetup(t,
+				&chserver.Config{KeySeed: "foobar", Auth: "foo:bar", ObfsKey: "s3cret"},
+				&chclient.Config{
+					Remotes: []string{"0.0.0.0:" + tmpPort + ":127.0.0.1:$FILEPORT"},
+					Auth:    "foo:bar",
+					ObfsKey: "s3cret",
+					Mode:    mode,
+				})
+			defer teardown()
+			result, err := post("http://localhost:"+tmpPort, "foo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result != "foo!" {
+				t.Fatalf("expected exclamation mark added, got %q", result)
+			}
+			//wrong password, right obfs key: SSH auth must still refuse it
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			s, err := chserver.NewServer(&chserver.Config{Auth: "foo:bar", ObfsKey: "s3cret"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			port := availablePort()
+			if err := s.StartContext(ctx, "127.0.0.1", port); err != nil {
+				t.Fatal(err)
+			}
+			c, err := chclient.NewClient(&chclient.Config{
+				Server:        "http://127.0.0.1:" + port,
+				Fingerprint:   s.GetFingerprint(),
+				Remotes:       []string{availablePort() + ":127.0.0.1:1"},
+				Auth:          "foo:wrong",
+				ObfsKey:       "s3cret",
+				Mode:          mode,
+				MaxRetryCount: 0,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := c.Start(ctx); err != nil {
+				t.Fatal(err)
+			}
+			readyCtx, readyCancel := context.WithTimeout(ctx, 3*time.Second)
+			defer readyCancel()
+			if c.Ready(readyCtx) {
+				t.Fatal("client with the wrong password connected")
+			}
+		})
+	}
+}

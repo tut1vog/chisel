@@ -105,7 +105,11 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 				return false, err
 			}
 		}
-		wsConn, _, err := d.DialContext(ctx, c.server, c.config.Headers)
+		headers, err := c.tunnelHeaders()
+		if err != nil {
+			return false, err
+		}
+		wsConn, _, err := d.DialContext(ctx, c.server, headers)
 		if err != nil {
 			return false, err
 		}
@@ -143,14 +147,20 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		// The stream request lives for the whole session; give it a cancelable
 		// context so Close (via the SSH conn) can abort the in-flight request.
 		sseCtx, sseCancel := context.WithCancel(ctx)
-		req, err := http.NewRequestWithContext(sseCtx, "POST", sseURL, strings.NewReader(`{"stream":true}`))
+		headers, err := c.tunnelHeaders()
 		if err != nil {
 			sseCancel()
 			return false, err
 		}
-		applySSEHeaders(req, c.config.Headers)
-		req.Header.Set("Content-Type", "application/json")
+		//opened like a browser EventSource
+		req, err := http.NewRequestWithContext(sseCtx, "GET", sseURL, nil)
+		if err != nil {
+			sseCancel()
+			return false, err
+		}
+		applySSEHeaders(req, headers)
 		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Cache-Control", "no-cache")
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			sseCancel()
@@ -161,12 +171,20 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 			sseCancel()
 			return false, fmt.Errorf("sse handshake failed: status %d", resp.StatusCode)
 		}
-		conn, err = cnet.NewClientSSEConn(sseCtx, sseCancel, resp, httpClient, c.config.Headers, sseURL, c.sseRate)
-		if err != nil {
+		//a refused tunnel is served as an ordinary page, possibly a 200
+		//from --backend, so require the stream and its session cookie
+		var sseSid string
+		for _, ck := range resp.Cookies() {
+			if ck.Name == cnet.SessionCookie {
+				sseSid = ck.Value
+			}
+		}
+		if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") || sseSid == "" {
 			resp.Body.Close()
 			sseCancel()
-			return false, err
+			return false, fmt.Errorf("sse handshake failed: not a tunnel response (wrong --obfs-key or path?)")
 		}
+		conn = cnet.NewClientSSEConn(sseCtx, sseCancel, resp, httpClient, c.config.Headers, sseURL, sseSid, c.sseRate)
 	default:
 		return false, fmt.Errorf("unknown transport mode: %q", c.config.Mode)
 	}
@@ -210,6 +228,25 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 	c.Infof("Disconnected")
 	connected = time.Since(t0) > 5*time.Second
 	return connected, err
+}
+
+// tunnelHeaders returns the configured headers for a request that opens a
+// tunnel, plus a fresh token cookie when --obfs-key is set.
+func (c *Client) tunnelHeaders() (http.Header, error) {
+	h := c.config.Headers.Clone()
+	if c.obfsKey == nil {
+		return h, nil
+	}
+	token, err := cnet.NewObfsToken(c.obfsKey)
+	if err != nil {
+		return nil, err
+	}
+	cookie := (&http.Cookie{Name: cnet.SessionCookie, Value: token}).String()
+	if existing := h.Get("Cookie"); existing != "" {
+		cookie = existing + "; " + cookie
+	}
+	h.Set("Cookie", cookie)
+	return h, nil
 }
 
 // applySSEHeaders replays the client-configured headers onto the stream request,
