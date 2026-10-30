@@ -97,3 +97,19 @@ func TestKeepAliveLoopHealthy(t *testing.T) {
 	}
 	conn.Close()
 }
+
+//TestKeepAliveJitter verifies ping intervals vary within [d/2, d]
+func TestKeepAliveJitter(t *testing.T) {
+	d := 25 * time.Second
+	seen := map[time.Duration]bool{}
+	for range 100 {
+		j := keepAliveJitter(d)
+		if j < d/2 || j > d {
+			t.Fatalf("jitter %s outside [%s, %s]", j, d/2, d)
+		}
+		seen[j] = true
+	}
+	if len(seen) < 50 {
+		t.Fatalf("only %d distinct intervals in 100", len(seen))
+	}
+}

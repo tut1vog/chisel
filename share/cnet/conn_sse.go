@@ -1,6 +1,8 @@
 package cnet
 
 import (
+	"crypto/rand"
+	"encoding/json"
 	"time"
 )
 
@@ -12,7 +14,7 @@ import (
 //	          -> 200 text/event-stream, Set-Cookie: session=<id>
 //	down:     data: {"content":"<base64>"}            (one event per <=2 KiB)
 //	up:       POST <endpoint>, Cookie: session=<id>, {"content":"<base64>"}
-//	          -> 200 {"status":"ok"}
+//	          -> 200 {"id":"msg_<random>","status":"ok","received":<bytes>}
 //
 // Requests that fail these checks are served as ordinary web requests.
 // Client writes are batched: one upload is in flight at a time and whatever
@@ -37,9 +39,29 @@ const (
 	sseMaxBatch = 64 * 1024
 	// sseMaxPending bounds buffered upload bytes before Write blocks
 	sseMaxPending = 1024 * 1024
-	// SSEUploadOK is the body of a successful upload response
-	SSEUploadOK = `{"status":"ok"}`
 )
+
+// SSEAck is the JSON body of a successful upload response. Each one carries
+// a fresh id and the upload's size, so acknowledgements are not a run of
+// identical responses on the wire.
+type SSEAck struct {
+	ID       string `json:"id"`
+	Status   string `json:"status"`
+	Received int    `json:"received"`
+}
+
+// NewSSEAck returns the response body acknowledging an upload of n bytes
+func NewSSEAck(n int) []byte {
+	b, _ := json.Marshal(SSEAck{ID: "msg_" + rand.Text(), Status: "ok", Received: n})
+	return b
+}
+
+// validSSEAck reports whether body acknowledges an upload of n bytes
+func validSSEAck(body []byte, n int) bool {
+	var ack SSEAck
+	return json.Unmarshal(body, &ack) == nil && ack.Status == "ok" &&
+		ack.Received == n && len(ack.ID) > len("msg_")
+}
 
 // Pacer limits a stream to a fixed number of bytes per second, allowing a
 // short burst after idle periods. A nil Pacer does not limit.

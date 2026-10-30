@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	mrand "math/rand/v2"
 	"os"
 	"sync"
 	"time"
@@ -189,8 +190,8 @@ func (t *Tunnel) BindRemotes(ctx context.Context, remotes []*settings.Remote) er
 func (t *Tunnel) keepAliveLoop(sshConn ssh.Conn) {
 	//ping forever
 	pingTimeout := settings.EnvDuration("PING_TIMEOUT", t.Config.KeepAlive)
-	ticker := time.NewTicker(t.Config.KeepAlive)
-	defer ticker.Stop()
+	timer := time.NewTimer(keepAliveJitter(t.Config.KeepAlive))
+	defer timer.Stop()
 	//stop the loop when the connection closes
 	closed := make(chan struct{})
 	go func() {
@@ -201,8 +202,9 @@ func (t *Tunnel) keepAliveLoop(sshConn ssh.Conn) {
 		select {
 		case <-closed:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
+		timer.Reset(keepAliveJitter(t.Config.KeepAlive))
 		if err := t.keepAlivePing(sshConn, pingTimeout); err != nil {
 			t.Debugf("ping failed: %s", err)
 			break
@@ -210,6 +212,13 @@ func (t *Tunnel) keepAliveLoop(sshConn ssh.Conn) {
 	}
 	//close ssh connection on abnormal ping
 	sshConn.Close()
+}
+
+//keepAliveJitter returns a random wait in [d/2, d], so pings do not form
+//a fixed-period heartbeat on the wire, yet never come later than the
+//configured interval (which may be tuned to a proxy's idle timeout)
+func keepAliveJitter(d time.Duration) time.Duration {
+	return d/2 + mrand.N(d/2+1)
 }
 
 //keepAlivePing sends an ssh ping request and waits for the reply.

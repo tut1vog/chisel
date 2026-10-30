@@ -165,7 +165,7 @@ func (c *ClientSSEConn) upload(b []byte) error {
 	}
 	//an unknown session is served like any web request, which may well
 	//be a 200 from --backend; only the acknowledgement means delivered
-	if string(ack) != SSEUploadOK {
+	if !validSSEAck(ack, len(b)) {
 		return fmt.Errorf("upload not acknowledged")
 	}
 	return nil

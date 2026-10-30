@@ -190,7 +190,7 @@ func (u *uploadRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	u.mu.Lock()
 	u.uploads = append(u.uploads, msg.Content)
 	u.mu.Unlock()
-	w.Write([]byte(SSEUploadOK))
+	w.Write(NewSSEAck(len(msg.Content)))
 }
 
 func (u *uploadRecorder) joined() ([]byte, int) {
@@ -246,6 +246,10 @@ func TestSSEClientWriteFailsAfterUploadError(t *testing.T) {
 		"unacknowledged 200": func(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte("<html>welcome</html>"))
 		},
+		//an ack must account for every uploaded byte
+		"short ack": func(w http.ResponseWriter, r *http.Request) {
+			w.Write(NewSSEAck(1))
+		},
 	} {
 		t.Run(name, func(t *testing.T) { testUploadFailure(t, handler) })
 	}
@@ -278,5 +282,24 @@ func TestPacer(t *testing.T) {
 	}
 	if d := time.Since(start); d < 600*time.Millisecond || d > 2*time.Second {
 		t.Fatalf("100KiB at 100KiB/s took %s", d)
+	}
+}
+
+func TestSSEAckVaries(t *testing.T) {
+	seen := map[string]bool{}
+	for range 100 {
+		b := NewSSEAck(42)
+		if !validSSEAck(b, 42) || validSSEAck(b, 41) {
+			t.Fatalf("ack %s misvalidated", b)
+		}
+		if seen[string(b)] {
+			t.Fatalf("repeated ack %s", b)
+		}
+		seen[string(b)] = true
+	}
+	for _, b := range []string{`{"status":"ok"}`, `{"status":"ok","received":42}`, `{"id":"msg_x","status":"error","received":42}`} {
+		if validSSEAck([]byte(b), 42) {
+			t.Fatalf("accepted %s", b)
+		}
 	}
 }

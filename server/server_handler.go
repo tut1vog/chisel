@@ -211,7 +211,7 @@ func (s *Server) handleSSEUpload(w http.ResponseWriter, req *http.Request) bool 
 		return true
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.Write([]byte(cnet.SSEUploadOK))
+	w.Write(cnet.NewSSEAck(len(msg.Content)))
 	return true
 }
 
