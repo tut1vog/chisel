@@ -12,6 +12,7 @@ import (
 
 	chclient "github.com/jpillora/chisel/client"
 	chserver "github.com/jpillora/chisel/server"
+	"github.com/jpillora/chisel/share/settings"
 )
 
 var debug = true
@@ -25,7 +26,7 @@ type testLayout struct {
 	udpServer  bool
 }
 
-func (tl *testLayout) setup(tb testing.TB) (server *chserver.Server, client *chclient.Client, teardown func()) {
+func (tl *testLayout) setup(t testing.TB) (server *chserver.Server, client *chclient.Client, teardown func()) {
 	//start of the world
 	// goroutines := runtime.NumGoroutine()
 	//root cancel
@@ -42,7 +43,7 @@ func (tl *testLayout) setup(tb testing.TB) (server *chserver.Server, client *chc
 		}
 		fl, err := net.Listen("tcp", fileAddr)
 		if err != nil {
-			tb.Fatal(err)
+			t.Fatal(err)
 		}
 		log.Printf("fileserver: listening on %s", fileAddr)
 		go func() {
@@ -55,14 +56,18 @@ func (tl *testLayout) setup(tb testing.TB) (server *chserver.Server, client *chc
 		}()
 	}
 	//server
+	_, benchmarking := t.(*testing.B)
 	server, err := chserver.NewServer(tl.server)
 	if err != nil {
-		tb.Fatal(err)
+		t.Fatal(err)
 	}
-	server.Debug = debug
+	server.Debug = debug && !benchmarking
+	if benchmarking {
+		server.SetOutput(io.Discard)
+	}
 	port := availablePort()
 	if err := server.StartContext(ctx, "127.0.0.1", port); err != nil {
-		tb.Fatal(err)
+		t.Fatal(err)
 	}
 	go func() {
 		server.Wait()
@@ -85,11 +90,14 @@ func (tl *testLayout) setup(tb testing.TB) (server *chserver.Server, client *chc
 	}
 	client, err = chclient.NewClient(tl.client)
 	if err != nil {
-		tb.Fatal(err)
+		t.Fatal(err)
 	}
-	client.Debug = debug
+	client.Debug = debug && !benchmarking
+	if benchmarking {
+		client.SetOutput(io.Discard)
+	}
 	if err := client.Start(ctx); err != nil {
-		tb.Fatal(err)
+		t.Fatal(err)
 	}
 	go func() {
 		client.Wait()
@@ -110,11 +118,31 @@ func (tl *testLayout) setup(tb testing.TB) (server *chserver.Server, client *chc
 		// 	t.Fatalf("goroutines left %d", d)
 		// }
 	}
-	//wait a bit...
-	//TODO: client signal API, similar to os.Notify(signal)
-	//      wait for client setup
-	time.Sleep(50 * time.Millisecond)
-	//ready
+	//wait for the client to establish its server connection.
+	//negative tests may never connect (e.g. rejected client certs):
+	//their own assertions decide the outcome
+	if !client.Ready(ctx) {
+		t.Log("setup: client did not become ready")
+		return server, client, teardown
+	}
+	//wait for tunnel listeners to accept: forward remotes bind on
+	//the client at Start, but reverse remotes are bound on the
+	//server after the handshake completes
+	for _, s := range tl.client.Remotes {
+		r, err := settings.DecodeRemote(s)
+		if err != nil || r.Stdio || r.LocalProto != "tcp" {
+			continue
+		}
+		addr := "127.0.0.1:" + r.LocalPort
+		for i := 0; i < 100; i++ {
+			conn, err := net.DialTimeout("tcp", addr, 100*time.Millisecond)
+			if err == nil {
+				conn.Close()
+				break
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
 	return server, client, teardown
 }
 

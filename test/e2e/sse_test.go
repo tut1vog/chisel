@@ -56,7 +56,7 @@ func TestSSEAuth(t *testing.T) {
 	teardown := simpleSetup(t,
 		&chserver.Config{
 			KeySeed: "foobar",
-			Auth:    "../bench/userfile",
+			Auth:    "foo:bar",
 		},
 		&chclient.Config{
 			Remotes: []string{
