@@ -1,9 +1,11 @@
 package chclient
 
 import (
+	"context"
 	"crypto/elliptic"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -129,6 +131,48 @@ func TestSSEURL(t *testing.T) {
 		}
 		if got, err := c.sseURL(); err != nil || got != want {
 			t.Errorf("%s: got %q (%v), want %q", server, got, err, want)
+		}
+	}
+}
+
+//TestSSEHandshakeErrors verifies a 200 that is not a tunnel stream names the
+//check it failed, e.g. a proxy that removed Set-Cookie
+func TestSSEHandshakeErrors(t *testing.T) {
+	for name, c := range map[string]struct {
+		contentType, cookie, want string
+	}{
+		"cookie removed":       {"text/event-stream", "", `no "session" cookie`},
+		"cookie renamed":       {"text/event-stream", "sid=abc", `no "session" cookie`},
+		"content type changed": {"text/html", "session=abc", `Content-Type "text/html"`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", c.contentType)
+				if c.cookie != "" {
+					w.Header().Set("Set-Cookie", c.cookie)
+				}
+			}))
+			defer srv.Close()
+			cl, err := NewClient(&Config{Server: srv.URL, Mode: "sse", Remotes: []string{"9000"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = cl.connectionOnce(context.Background())
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("got error %v, want one containing %s", err, c.want)
+			}
+		})
+	}
+}
+
+func TestRedactSetCookie(t *testing.T) {
+	for in, want := range map[string]string{
+		"session=80ccb130; Path=/sse; HttpOnly": "session=<8 bytes>; Path=/sse; HttpOnly",
+		"session=abc":                           "session=<3 bytes>",
+		"garbage":                               "garbage",
+	} {
+		if got := redactSetCookie(in); got != want {
+			t.Errorf("%q: got %q, want %q", in, got, want)
 		}
 	}
 }

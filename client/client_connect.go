@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -95,6 +96,40 @@ func (c *Client) sseURL() (string, error) {
 	return u.String(), nil
 }
 
+// debugHeaders formats h one header per line for the debug log, with
+// Set-Cookie values replaced by their length since they carry session ids
+func debugHeaders(h http.Header) string {
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		for _, v := range h[k] {
+			if k == "Set-Cookie" {
+				v = redactSetCookie(v)
+			}
+			fmt.Fprintf(&b, "\n  %s: %s", k, v)
+		}
+	}
+	return b.String()
+}
+
+// redactSetCookie replaces a Set-Cookie value with its length, keeping the
+// cookie name and attributes (Path, Domain, ...) which are not secret
+func redactSetCookie(v string) string {
+	pair, attrs, _ := strings.Cut(v, ";")
+	name, val, ok := strings.Cut(pair, "=")
+	if !ok {
+		return v
+	}
+	if attrs != "" {
+		attrs = ";" + attrs
+	}
+	return fmt.Sprintf("%s=<%d bytes>%s", name, len(strings.TrimSpace(val)), attrs)
+}
+
 // connectionOnce connects to the chisel server and blocks
 func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error) {
 	//already closed?
@@ -178,6 +213,8 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 			sseCancel()
 			return false, err
 		}
+		//what actually arrived, which a proxy on the way may have altered
+		c.Debugf("SSE handshake response: %s %s%s", resp.Proto, resp.Status, debugHeaders(resp.Header))
 		if resp.StatusCode != http.StatusOK {
 			resp.Body.Close()
 			sseCancel()
@@ -191,10 +228,15 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 				sseSid = ck.Value
 			}
 		}
-		if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") || sseSid == "" {
+		if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 			resp.Body.Close()
 			sseCancel()
-			return false, fmt.Errorf("sse handshake failed: not a tunnel response (wrong --obfs-key or path?)")
+			return false, fmt.Errorf("sse handshake failed: Content-Type %q is not text/event-stream (wrong --obfs-key or path, or changed by a proxy?)", ct)
+		}
+		if sseSid == "" {
+			resp.Body.Close()
+			sseCancel()
+			return false, fmt.Errorf("sse handshake failed: no %q cookie in the response (wrong --obfs-key or path, or Set-Cookie removed by a proxy?)", cnet.SessionCookie)
 		}
 		conn = cnet.NewClientSSEConn(sseCtx, sseCancel, resp, httpClient, c.config.Headers, sseURL, sseSid, c.sseRate)
 	default:
