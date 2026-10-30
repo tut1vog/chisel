@@ -12,7 +12,7 @@ import (
 
 	chclient "github.com/jpillora/chisel/client"
 	chserver "github.com/jpillora/chisel/server"
-	chshare "github.com/jpillora/chisel/share"
+	"github.com/jpillora/chisel/share/cnet"
 )
 
 // startSSEServer starts a bare chisel server for raw SSE requests.
@@ -38,7 +38,6 @@ func openSSESession(t *testing.T, url string) (string, *http.Response) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("X-Chisel-Client-Version", chshare.ProtocolVersion)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -47,7 +46,12 @@ func openSSESession(t *testing.T, url string) (string, *http.Response) {
 		resp.Body.Close()
 		t.Fatalf("handshake status %d", resp.StatusCode)
 	}
-	sid := resp.Header.Get("X-Chisel-Session-Id")
+	var sid string
+	for _, c := range resp.Cookies() {
+		if c.Name == cnet.SSESessionCookie {
+			sid = c.Value
+		}
+	}
 	if sid == "" {
 		resp.Body.Close()
 		t.Fatal("missing session id")
@@ -62,7 +66,7 @@ func postSSE(t *testing.T, url, sid string, body []byte) int {
 		t.Fatal(err)
 	}
 	if sid != "" {
-		req.Header.Set("X-Chisel-Session-Id", sid)
+		req.AddCookie(&http.Cookie{Name: cnet.SSESessionCookie, Value: sid})
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

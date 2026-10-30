@@ -178,6 +178,13 @@ $ chisel server --help
     chisel receives a normal HTTP request. Useful for hiding chisel in
     plain sight. --proxy is accepted as an alias for this flag.
 
+    --path, An optional URL path that tunnel connections must use, for
+    example /api/stream. Websocket tunnels are only accepted on this path
+    and SSE tunnels on <path>/sse; other requests, including websocket
+    upgrades, go to --backend. Clients select the path by including it
+    in the server URL. Defaults to accepting websocket tunnels on any
+    path and SSE on /sse.
+
     --socks5, Allow clients to access the internal SOCKS5 proxy. See
     chisel client --help for more information.
 
@@ -377,8 +384,9 @@ $ chisel client --help
 
     --sse, Use Server-Sent Events as the transport instead of WebSockets.
     The client streams the server-to-client direction over a long-lived
-    "GET /sse" response and sends each client-to-server frame as a
-    separate "POST /sse". This helps traverse proxies or gateways that
+    "GET <path>/sse" response and sends each client-to-server frame as a
+    separate "POST <path>/sse", where <path> is the server URL's path.
+    This helps traverse proxies or gateways that
     do not allow WebSocket upgrades, at the cost of throughput (each
     upstream frame is one HTTP round-trip).
 

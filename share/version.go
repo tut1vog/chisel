@@ -5,12 +5,6 @@ import (
 	"strings"
 )
 
-//ProtocolVersion of chisel. When backwards
-//incompatible changes are made, this will
-//be incremented to signify a protocol
-//mismatch.
-var ProtocolVersion = "chisel-v3"
-
 //BuildVersion is set at build time via ldflags,
 //and otherwise falls back to the go module version
 //embedded by `go install pkg@version` (see init)

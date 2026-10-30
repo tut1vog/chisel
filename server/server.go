@@ -8,12 +8,12 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
-	chshare "github.com/jpillora/chisel/share"
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cio"
 	"github.com/jpillora/chisel/share/cnet"
@@ -29,6 +29,7 @@ type Config struct {
 	AuthFile  string        `opts:"name=authfile,short=-" help:"An optional path to a users.json file. This file should be an object with users defined like:\n  {\n    \"<user:pass>\": [\"<addr-regex>\",\"<addr-regex>\"]\n  }\nwhen <user> connects, their <pass> will be verified and then each of the remote addresses will be compared against the list of address regular expressions for a match. Patterns are NOT anchored by default: \"10.0.0.1:80\" also matches \"210.0.0.1:8080\", and \".\" matches any character. Anchor your patterns, e.g. \"^10\\.0\\.0\\.1:80$\". The empty string \"\" matches every address. Addresses will always come in the form \"<remote-host>:<remote-port>\" for normal remotes, \"R:<local-interface>:<local-port>\" for reverse port forwarding remotes, and \"socks\" for SOCKS5 proxy access. Note that SOCKS5 access previously bypassed this list; existing authfiles which should allow SOCKS5 must add an entry matching \"socks\" (the empty wildcard \"\" matches everything, including \"socks\"). This file will be automatically reloaded on change. Reloads apply to new connections and to new tunnels of connected clients; established tunnels are not interrupted."`
 	Auth      string        `opts:"name=auth,short=-" help:"An optional string representing a single user with full access, in the form of <user:pass>. It is equivalent to creating an authfile with {\"<user:pass>\": [\"\"]}. If unset, it will use the environment variable AUTH."`
 	Proxy     string        `opts:"name=backend,short=-" help:"Specifies another HTTP server to proxy requests to when chisel receives a normal HTTP request. Useful for hiding chisel in plain sight. --proxy is accepted as an alias for this flag."`
+	Path      string        `opts:"name=path,short=-" help:"An optional URL path that tunnel connections must use, for example /api/stream. Websocket tunnels are only accepted on this path and SSE tunnels on <path>/sse; other requests, including websocket upgrades, go to --backend. Clients select the path by including it in the server URL. Defaults to accepting websocket tunnels on any path and SSE on /sse."`
 	Socks5    bool          `opts:"name=socks5,short=-" help:"Allow clients to access the internal SOCKS5 proxy. See chisel client --help for more information."`
 	Reverse   bool          `opts:"name=reverse,short=-" help:"Allow clients to specify reverse port forwarding remotes in addition to normal remotes."`
 	KeepAlive time.Duration `opts:"name=keepalive,short=-" help:"An optional keepalive interval. Since the underlying transport is HTTP, in many instances we'll be traversing through proxies, often these proxies will close idle connections. You must specify a time with a unit, for example '5s' or '2m'. Defaults to '25s' (set to 0s to disable)."`
@@ -64,6 +65,9 @@ func NewServer(c *Config) (*Server, error) {
 		sseShutdown: make(chan struct{}),
 	}
 	server.Info = true
+	if c.Path != "" {
+		c.Path = path.Join("/", c.Path)
+	}
 	//SSE streams are ordinary in-flight requests, so a graceful shutdown
 	//would wait out the whole grace period for them; end them up front
 	var sseShutdownOnce sync.Once
@@ -124,7 +128,6 @@ func NewServer(c *Config) (*Server, error) {
 	server.fingerprint = ccrypto.FingerprintKey(private.PublicKey())
 	//create ssh config
 	server.sshConfig = &ssh.ServerConfig{
-		ServerVersion:    "SSH-" + chshare.ProtocolVersion + "-server",
 		PasswordCallback: server.authUser,
 	}
 	server.sshConfig.AddHostKey(private)

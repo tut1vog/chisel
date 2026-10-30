@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"path"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -21,36 +22,27 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// ssePath is the sse endpoint: <path>/sse, or /sse when --path is unset
+func (s *Server) ssePath() string {
+	return path.Join("/", s.config.Path, "sse")
+}
+
 // handleClientHandler is the main http websocket handler for the chisel server
 func (s *Server) handleClientHandler(w http.ResponseWriter, r *http.Request) {
-	//websockets upgrade AND has chisel prefix
+	//tunnel requests carry no chisel-specific headers; they are recognised
+	//by path alone (any path for websockets when --path is unset)
 	upgrade := strings.ToLower(r.Header.Get("Upgrade"))
-	protocol := r.Header.Get("Sec-WebSocket-Protocol")
-	if protocol == "" {
-		protocol = r.Header.Get("X-Chisel-Client-Version")
-	}
-	if upgrade == "websocket" {
-		if protocol == chshare.ProtocolVersion {
-			s.handleWebsocket(w, r)
-			return
-		}
-		//print into server logs and silently fall-through
-		s.Infof("ignored client connection using protocol '%s', expected '%s'",
-			protocol, chshare.ProtocolVersion)
+	if upgrade == "websocket" && (s.config.Path == "" || r.URL.Path == s.config.Path) {
+		s.handleWebsocket(w, r)
+		return
 	}
 	//sse transport (handled before the reverse proxy so it also works with --backend)
-	if r.URL.Path == "/sse" {
+	if r.URL.Path == s.ssePath() {
 		switch r.Method {
 		case http.MethodPost:
 			//data frame upload; the session was already validated at handshake
 			s.handleSSEPost(w, r)
 		case http.MethodGet:
-			if protocol != chshare.ProtocolVersion {
-				s.Infof("ignored client connection using protocol '%s', expected '%s'",
-					protocol, chshare.ProtocolVersion)
-				w.WriteHeader(http.StatusBadRequest)
-				return
-			}
 			s.handleSSEGet(w, r)
 		default:
 			w.WriteHeader(http.StatusMethodNotAllowed)
@@ -113,7 +105,13 @@ func (s *Server) handleSSEGet(w http.ResponseWriter, req *http.Request) {
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
-	h.Set("X-Chisel-Session-Id", key)
+	http.SetCookie(w, &http.Cookie{
+		Name:     cnet.SSESessionCookie,
+		Value:    key,
+		Path:     s.ssePath(),
+		HttpOnly: true,
+		Secure:   req.TLS != nil,
+	})
 	w.WriteHeader(http.StatusOK)
 	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
@@ -143,7 +141,10 @@ func (s *Server) handleSSEPost(w http.ResponseWriter, req *http.Request) {
 	defer req.Body.Close()
 	//resolve the session before reading anything, so unknown peers
 	//cannot make the server buffer a body at all
-	sseSid := req.Header.Get("X-Chisel-Session-Id")
+	var sseSid string
+	if c, err := req.Cookie(cnet.SSESessionCookie); err == nil {
+		sseSid = c.Value
+	}
 	val, ok := s.sseSessions.Load(sseSid)
 	if !ok {
 		s.Debugf("sseSid not found, client should reconnect")

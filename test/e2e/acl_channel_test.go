@@ -25,7 +25,6 @@ func dialChiselSSH(t *testing.T, serverAddr, user, pass string) (ssh.Conn, <-cha
 	t.Helper()
 	ws, _, err := (&websocket.Dialer{
 		HandshakeTimeout: 5 * time.Second,
-		Subprotocols:     []string{"chisel-v3"},
 	}).Dial("ws://"+serverAddr, http.Header{})
 	if err != nil {
 		t.Fatalf("websocket dial: %v", err)

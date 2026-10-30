@@ -30,10 +30,9 @@ func TestPreAuthOversizedMessage(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer s.Close()
-	//raw websocket connection with the chisel subprotocol, no ssh
+	//raw websocket connection, no ssh
 	ws, _, err := (&websocket.Dialer{
 		HandshakeTimeout: 5 * time.Second,
-		Subprotocols:     []string{"chisel-v3"},
 	}).Dial("ws://127.0.0.1:"+port, http.Header{})
 	if err != nil {
 		t.Fatal(err)

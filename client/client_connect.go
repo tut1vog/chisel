@@ -14,7 +14,6 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/jpillora/backoff"
-	chshare "github.com/jpillora/chisel/share"
 	"github.com/jpillora/chisel/share/cnet"
 	"github.com/jpillora/chisel/share/cos"
 	"github.com/jpillora/chisel/share/settings"
@@ -96,7 +95,6 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		//prepare dialer
 		d := websocket.Dialer{
 			HandshakeTimeout: settings.EnvDuration("WS_TIMEOUT", 45*time.Second),
-			Subprotocols:     []string{chshare.ProtocolVersion},
 			TLSClientConfig:  c.tlsConfig,
 			ReadBufferSize:   settings.EnvInt("WS_BUFF_SIZE", 0),
 			WriteBufferSize:  settings.EnvInt("WS_BUFF_SIZE", 0),
@@ -151,7 +149,6 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 			return false, err
 		}
 		applySSEHeaders(req, c.config.Headers)
-		req.Header.Set("X-Chisel-Client-Version", chshare.ProtocolVersion)
 		req.Header.Set("Accept", "text/event-stream")
 		resp, err := httpClient.Do(req)
 		if err != nil {
@@ -163,7 +160,12 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 			sseCancel()
 			return false, fmt.Errorf("sse handshake failed: status %d", resp.StatusCode)
 		}
-		sseSid := resp.Header.Get("X-Chisel-Session-Id")
+		var sseSid string
+		for _, ck := range resp.Cookies() {
+			if ck.Name == cnet.SSESessionCookie {
+				sseSid = ck.Value
+			}
+		}
 		if sseSid == "" {
 			resp.Body.Close()
 			sseCancel()

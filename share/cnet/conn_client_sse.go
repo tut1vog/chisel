@@ -18,6 +18,10 @@ import (
 // headroom over bufio.Scanner's 64 KiB default token limit.
 const maxSSEFrame = 512 * 1024
 
+// SSESessionCookie names the cookie that correlates the client's POSTs with
+// its streaming GET, set by the server on the handshake response.
+const SSESessionCookie = "sid"
+
 // ClientSSEConn is a net.Conn over the chisel SSE transport. The server->client
 // direction is the long-lived GET response body (base64 "data:" frames); the
 // client->server direction is one POST per Write.
@@ -97,7 +101,7 @@ func (c *ClientSSEConn) Write(b []byte) (int, error) {
 	}
 	applyHeaders(req, c.headers)
 	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("X-Chisel-Session-Id", c.sessionID)
+	req.AddCookie(&http.Cookie{Name: SSESessionCookie, Value: c.sessionID})
 	resp, err := c.client.Do(req)
 	if err != nil {
 		return 0, err
