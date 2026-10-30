@@ -3,11 +3,18 @@ package cnet
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
+	"encoding/json"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 // flushRecorder is a minimal http.ResponseWriter + http.Flusher that accumulates
@@ -41,7 +48,7 @@ func readConn(r io.Reader) *ClientSSEConn {
 func encodeFrames(t *testing.T, payloads ...[]byte) []byte {
 	t.Helper()
 	rec := &flushRecorder{}
-	conn := NewServerSSEConn(rec, nil).(*ServerSSEConn)
+	conn := NewServerSSEConn(rec, nil, nil).(*ServerSSEConn)
 	for _, p := range payloads {
 		n, err := conn.Write(p)
 		if err != nil {
@@ -118,7 +125,7 @@ func TestSSELargeFrame(t *testing.T) {
 }
 
 func TestSSEReadMalformed(t *testing.T) {
-	conn := readConn(strings.NewReader("data:not valid base64!!!\n\n"))
+	conn := readConn(strings.NewReader("data: {\"content\":\"not valid base64!!!\"}\n\n"))
 	if _, err := conn.Read(make([]byte, 64)); err == nil {
 		t.Fatal("expected an error decoding a malformed data frame")
 	}
@@ -133,5 +140,133 @@ func TestSSEReadEOF(t *testing.T) {
 	}
 	if err != io.EOF {
 		t.Fatalf("expected io.EOF, got %v", err)
+	}
+}
+
+func TestSSEEventsAreJSONAndSplit(t *testing.T) {
+	payload := make([]byte, 3*sseEventMax+5)
+	rand.Read(payload)
+	stream := encodeFrames(t, payload)
+	events := 0
+	for _, line := range strings.Split(string(stream), "\n") {
+		if line == "" {
+			continue
+		}
+		raw, ok := strings.CutPrefix(line, "data: ")
+		if !ok {
+			t.Fatalf("unexpected line %q", line)
+		}
+		var ev sseEvent
+		if err := json.Unmarshal([]byte(raw), &ev); err != nil {
+			t.Fatalf("event is not JSON: %v", err)
+		}
+		if len(ev.Content) > sseEventMax {
+			t.Fatalf("event carries %d bytes, max %d", len(ev.Content), sseEventMax)
+		}
+		events++
+	}
+	if events < 4 || events > 13 {
+		t.Fatalf("expected 4-13 events, got %d", events)
+	}
+}
+
+// uploadRecorder is an SSE endpoint that records each upload's content
+type uploadRecorder struct {
+	mu      sync.Mutex
+	uploads [][]byte
+}
+
+func (u *uploadRecorder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var msg SSERequest
+	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil || msg.ID != "sid" {
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	if r.Header.Get("Content-Type") != "application/json" {
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		return
+	}
+	u.mu.Lock()
+	u.uploads = append(u.uploads, msg.Content)
+	u.mu.Unlock()
+	w.Write([]byte(SSEUploadOK))
+}
+
+func (u *uploadRecorder) joined() ([]byte, int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return bytes.Join(u.uploads, nil), len(u.uploads)
+}
+
+func newTestClientConn(t *testing.T, url string) net.Conn {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	resp := &http.Response{Body: io.NopCloser(strings.NewReader("data: {\"id\":\"sid\"}\n\n"))}
+	conn, err := NewClientSSEConn(ctx, cancel, resp, http.DefaultClient, http.Header{}, url, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	return conn
+}
+
+func TestSSEClientBatchesWrites(t *testing.T) {
+	rec := &uploadRecorder{}
+	srv := httptest.NewServer(rec)
+	defer srv.Close()
+	conn := newTestClientConn(t, srv.URL)
+	var want []byte
+	for i := range 50 {
+		msg := []byte(fmt.Sprintf("write-%02d;", i))
+		want = append(want, msg...)
+		if _, err := conn.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got, n := rec.joined()
+		if bytes.Equal(got, want) {
+			if n >= 50 {
+				t.Fatalf("50 writes took %d uploads; expected batching", n)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("uploads incomplete: got %q", got)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestSSEClientWriteFailsAfterUploadError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	conn := newTestClientConn(t, srv.URL)
+	conn.Write([]byte("hello"))
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := conn.Write([]byte("x")); err != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("writes kept succeeding after the upload failed")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestPacer(t *testing.T) {
+	var p *Pacer = NewPacer(0)
+	p.Wait(1 << 30) //nil pacer never blocks
+	p = NewPacer(100 * 1024)
+	start := time.Now()
+	for range 10 {
+		p.Wait(10 * 1024) //100 KiB at 100 KiB/s, less the initial burst
+	}
+	if d := time.Since(start); d < 600*time.Millisecond || d > 2*time.Second {
+		t.Fatalf("100KiB at 100KiB/s took %s", d)
 	}
 }

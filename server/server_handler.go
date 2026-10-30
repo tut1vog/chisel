@@ -3,12 +3,12 @@ package chserver
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"path"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -22,9 +22,12 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// ssePath is the sse endpoint: <path>/sse, or /sse when --path is unset
+// ssePath is the sse endpoint: --path itself, or /sse when --path is unset
 func (s *Server) ssePath() string {
-	return path.Join("/", s.config.Path, "sse")
+	if s.config.Path != "" {
+		return s.config.Path
+	}
+	return "/sse"
 }
 
 // handleClientHandler is the main http websocket handler for the chisel server
@@ -36,17 +39,10 @@ func (s *Server) handleClientHandler(w http.ResponseWriter, r *http.Request) {
 		s.handleWebsocket(w, r)
 		return
 	}
-	//sse transport (handled before the reverse proxy so it also works with --backend)
-	if r.URL.Path == s.ssePath() {
-		switch r.Method {
-		case http.MethodPost:
-			//data frame upload; the session was already validated at handshake
-			s.handleSSEPost(w, r)
-		case http.MethodGet:
-			s.handleSSEGet(w, r)
-		default:
-			w.WriteHeader(http.StatusMethodNotAllowed)
-		}
+	//sse transport (handled before the reverse proxy so it also works with
+	//--backend); other methods on the endpoint fall through like any request
+	if r.URL.Path == s.ssePath() && r.Method == http.MethodPost {
+		s.handleSSE(w, r)
 		return
 	}
 	//proxy target was provided
@@ -83,9 +79,40 @@ func (s *Server) handleWebsocket(w http.ResponseWriter, req *http.Request) {
 	s.buildSSHTunnel(conn, req, l)
 }
 
-// handleSSEGet is responsible for handling the sse handshake and the long-lived
+// handleSSE reads a client POST and either opens a stream or delivers an
+// upload to an open one, depending on its body.
+func (s *Server) handleSSE(w http.ResponseWriter, req *http.Request) {
+	defer req.Body.Close()
+	//a session is handed out before SSH authentication, so cap each
+	//body like the websocket read limit does (pre-auth memory DoS)
+	body := io.Reader(req.Body)
+	if limit := cnet.ConfiguredReadLimit(); limit > 0 {
+		body = http.MaxBytesReader(w, req.Body, limit)
+	}
+	var msg cnet.SSERequest
+	if err := json.NewDecoder(body).Decode(&msg); err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			s.Debugf("SSE request exceeds read limit (%d bytes)", maxErr.Limit)
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	switch {
+	case msg.ID != "":
+		s.handleSSEUpload(w, msg)
+	case msg.Stream:
+		s.handleSSEStream(w, req)
+	default:
+		w.WriteHeader(http.StatusBadRequest)
+	}
+}
+
+// handleSSEStream is responsible for the sse handshake and the long-lived
 // server->client stream.
-func (s *Server) handleSSEGet(w http.ResponseWriter, req *http.Request) {
+func (s *Server) handleSSEStream(w http.ResponseWriter, req *http.Request) {
 	id := atomic.AddInt32(&s.sessCount, 1)
 	l := s.Fork("session#%d", id)
 	// Generate a secure random ID
@@ -105,18 +132,13 @@ func (s *Server) handleSSEGet(w http.ResponseWriter, req *http.Request) {
 	h.Set("Cache-Control", "no-cache")
 	h.Set("Connection", "keep-alive")
 	h.Set("X-Accel-Buffering", "no")
-	http.SetCookie(w, &http.Cookie{
-		Name:     cnet.SSESessionCookie,
-		Value:    key,
-		Path:     s.ssePath(),
-		HttpOnly: true,
-		Secure:   req.TLS != nil,
-	})
 	w.WriteHeader(http.StatusOK)
-	if flusher, ok := w.(http.Flusher); ok {
-		flusher.Flush()
+	//the session id is the stream's first event
+	if err := cnet.WriteSSESessionID(w, key); err != nil {
+		pw.Close()
+		return
 	}
-	conn := cnet.NewServerSSEConn(w, pr)
+	conn := cnet.NewServerSSEConn(w, pr, cnet.NewPacer(s.sseRate))
 	// Always unblock the SSH read side: close the conn (pipe reader) and the
 	// pipe writer when this handler returns, even on a handshake failure.
 	defer conn.Close()
@@ -137,17 +159,11 @@ func (s *Server) handleSSEGet(w http.ResponseWriter, req *http.Request) {
 	s.buildSSHTunnel(conn, req, l)
 }
 
-func (s *Server) handleSSEPost(w http.ResponseWriter, req *http.Request) {
-	defer req.Body.Close()
-	//resolve the session before reading anything, so unknown peers
-	//cannot make the server buffer a body at all
-	var sseSid string
-	if c, err := req.Cookie(cnet.SSESessionCookie); err == nil {
-		sseSid = c.Value
-	}
-	val, ok := s.sseSessions.Load(sseSid)
+// handleSSEUpload delivers an upload's content to its session's stream
+func (s *Server) handleSSEUpload(w http.ResponseWriter, msg cnet.SSERequest) {
+	val, ok := s.sseSessions.Load(msg.ID)
 	if !ok {
-		s.Debugf("sseSid not found, client should reconnect")
+		s.Debugf("sse session not found, client should reconnect")
 		w.WriteHeader(http.StatusNotFound)
 		return
 	}
@@ -157,37 +173,20 @@ func (s *Server) handleSSEPost(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
-	//a session is handed out before SSH authentication, so cap each
-	//frame like the websocket read limit does (pre-auth memory DoS)
-	body := io.Reader(req.Body)
-	if limit := cnet.ConfiguredReadLimit(); limit > 0 {
-		body = http.MaxBytesReader(w, req.Body, limit)
-	}
-	bodyBytes, err := io.ReadAll(body)
-	if err != nil {
-		var maxErr *http.MaxBytesError
-		if errors.As(err, &maxErr) {
-			//mirror websocket: an oversized frame kills the session
-			s.Debugf("SSE frame exceeds read limit (%d bytes), closing session", maxErr.Limit)
-			pw.CloseWithError(err)
-			w.WriteHeader(http.StatusRequestEntityTooLarge)
-			return
-		}
-		s.Debugf("Read client data failed")
-		w.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-	_, err = pw.Write(bodyBytes)
-	if err != nil {
+	if _, err := pw.Write(msg.Content); err != nil {
 		s.Debugf("Failed to write client data: %s", err.Error())
 		//the session's read side is gone; tell the client to reconnect
 		w.WriteHeader(http.StatusGone)
 		return
 	}
-	w.WriteHeader(http.StatusOK)
+	w.Header().Set("Content-Type", "application/json")
+	w.Write([]byte(cnet.SSEUploadOK))
 }
 
 func (s *Server) buildSSHTunnel(conn net.Conn, req *http.Request, l *cio.Logger) {
+	if s.obfsKey != nil {
+		conn = cnet.NewObfsConn(conn, s.obfsKey, false)
+	}
 	sshConn, chans, reqs, err := ssh.NewServerConn(conn, s.sshConfig)
 	if err != nil {
 		s.logHandshakeFailure(err)

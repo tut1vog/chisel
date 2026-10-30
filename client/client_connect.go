@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"path"
 	"strings"
 	"time"
 
@@ -112,8 +111,7 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		}
 		conn = cnet.NewWebSocketConn(wsConn)
 	case "sse":
-		// Derive the SSE URL from the (ws/wss) server URL, preserving any base
-		// path or trailing slash instead of naive string concatenation.
+		// The SSE endpoint is the server URL's path, or /sse without one
 		u, err := url.Parse(c.server)
 		if err != nil {
 			return false, err
@@ -124,10 +122,12 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		case "wss":
 			u.Scheme = "https"
 		}
-		u.Path = path.Join("/", u.Path, "sse")
+		if u.Path == "" || u.Path == "/" {
+			u.Path = "/sse"
+		}
 		sseURL := u.String()
 		// Build one HTTP client that honors TLS, proxy and dialer config; it is
-		// shared by the handshake GET and every subsequent data POST.
+		// shared by the stream request and every subsequent upload.
 		transport := &http.Transport{
 			TLSClientConfig: c.tlsConfig,
 			DialContext:     c.config.DialContext,
@@ -140,15 +140,16 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 			transport.Proxy = http.ProxyURL(p)
 		}
 		httpClient := &http.Client{Transport: transport}
-		// The streaming GET lives for the whole session; give it a cancelable
+		// The stream request lives for the whole session; give it a cancelable
 		// context so Close (via the SSH conn) can abort the in-flight request.
 		sseCtx, sseCancel := context.WithCancel(ctx)
-		req, err := http.NewRequestWithContext(sseCtx, "GET", sseURL, nil)
+		req, err := http.NewRequestWithContext(sseCtx, "POST", sseURL, strings.NewReader(`{"stream":true}`))
 		if err != nil {
 			sseCancel()
 			return false, err
 		}
 		applySSEHeaders(req, c.config.Headers)
+		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "text/event-stream")
 		resp, err := httpClient.Do(req)
 		if err != nil {
@@ -160,22 +161,19 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 			sseCancel()
 			return false, fmt.Errorf("sse handshake failed: status %d", resp.StatusCode)
 		}
-		var sseSid string
-		for _, ck := range resp.Cookies() {
-			if ck.Name == cnet.SSESessionCookie {
-				sseSid = ck.Value
-			}
-		}
-		if sseSid == "" {
+		conn, err = cnet.NewClientSSEConn(sseCtx, sseCancel, resp, httpClient, c.config.Headers, sseURL, c.sseRate)
+		if err != nil {
 			resp.Body.Close()
 			sseCancel()
-			return false, fmt.Errorf("sse handshake failed: missing session id")
+			return false, err
 		}
-		conn = cnet.NewClientSSEConn(sseCtx, sseCancel, resp, httpClient, c.config.Headers, sseURL, sseSid)
 	default:
 		return false, fmt.Errorf("unknown transport mode: %q", c.config.Mode)
 	}
 
+	if c.obfsKey != nil {
+		conn = cnet.NewObfsConn(conn, c.obfsKey, true)
+	}
 	// perform SSH handshake on net.Conn
 	c.Debugf("Handshaking...")
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, "", c.sshConfig)
@@ -214,7 +212,7 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 	return connected, err
 }
 
-// applySSEHeaders replays the client-configured headers onto the handshake GET,
+// applySSEHeaders replays the client-configured headers onto the stream request,
 // translating Host into the request's Host field (net/http ignores a "Host"
 // header key otherwise).
 func applySSEHeaders(req *http.Request, headers http.Header) {

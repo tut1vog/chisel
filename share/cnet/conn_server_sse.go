@@ -1,9 +1,9 @@
 package cnet
 
 import (
-	"encoding/base64"
-	"fmt"
+	"encoding/json"
 	"io"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"time"
@@ -13,43 +13,69 @@ type ServerSSEConn struct {
 	// p saves accumulated requests from client
 	p *io.PipeReader
 	// w is ResponseWriter of SSE request
-	w http.ResponseWriter
+	w     http.ResponseWriter
+	pacer *Pacer
 }
 
-func NewServerSSEConn(w http.ResponseWriter, p *io.PipeReader) net.Conn {
-	c := ServerSSEConn{p, w}
-	return &c
+// NewServerSSEConn streams writes to w as JSON events, optionally paced, and
+// reads the client's uploads from p.
+func NewServerSSEConn(w http.ResponseWriter, p *io.PipeReader, pacer *Pacer) net.Conn {
+	return &ServerSSEConn{p: p, w: w, pacer: pacer}
+}
+
+// writeSSEEvent writes one "data:" event carrying ev as JSON
+func writeSSEEvent(w io.Writer, ev sseEvent) error {
+	b, err := json.Marshal(ev)
+	if err != nil {
+		return err
+	}
+	buf := make([]byte, 0, len(b)+8)
+	buf = append(buf, "data: "...)
+	buf = append(buf, b...)
+	buf = append(buf, "\n\n"...)
+	_, err = w.Write(buf)
+	return err
+}
+
+// WriteSSESessionID sends the session id as the stream's first event
+func WriteSSESessionID(w http.ResponseWriter, id string) error {
+	if err := writeSSEEvent(w, sseEvent{ID: id}); err != nil {
+		return err
+	}
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	return nil
 }
 
 func (c *ServerSSEConn) Read(dst []byte) (int, error) {
 	// directly read from pipe
-	n, err := c.p.Read(dst)
-	if err != nil {
-		return n, err
-	}
-	return n, nil
+	return c.p.Read(dst)
 }
 
 func (c *ServerSSEConn) Write(b []byte) (int, error) {
-	n := len(b)
-	_, err := fmt.Fprintf(c.w, "data:%s\n\n", base64.StdEncoding.EncodeToString(b))
-	if err != nil {
-		return 0, err
+	flusher, _ := c.w.(http.Flusher)
+	for rest := b; len(rest) > 0; {
+		//random event sizes, so a paced stream is not a run of equal events
+		n := min(len(rest), sseEventMax/4+mrand.IntN(sseEventMax*3/4+1))
+		c.pacer.Wait(n)
+		if err := writeSSEEvent(c.w, sseEvent{Content: rest[:n]}); err != nil {
+			return 0, err
+		}
+		rest = rest[n:]
+		//when paced, events trickle out one at a time
+		if c.pacer != nil && flusher != nil {
+			flusher.Flush()
+		}
 	}
-	flusher, ok := c.w.(http.Flusher)
-	if !ok {
-		return n, nil // data accepted but failed to flush
+	if c.pacer == nil && flusher != nil {
+		flusher.Flush()
 	}
-	flusher.Flush()
-	return n, nil
+	return len(b), nil
 }
 
 func (c *ServerSSEConn) Close() error {
-	err := c.p.Close()
-	if err != nil {
-		return err
-	}
-	return nil
+	return c.p.Close()
 }
 
 // LocalAddr and RemoteAddr return the conn itself as a placeholder net.Addr,

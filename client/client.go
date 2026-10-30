@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/jpillora/sizestr"
 	chshare "github.com/jpillora/chisel/share"
 	"github.com/jpillora/chisel/share/ccrypto"
 	"github.com/jpillora/chisel/share/cio"
@@ -45,6 +46,8 @@ type Config struct {
 	DialContext      func(ctx context.Context, network, addr string) (net.Conn, error) `opts:"-"`
 	Verbose          bool                                                              `opts:"name=verbose,short=v" help:"Enable verbose logging"`
 	Mode             string                                                            `opts:"-"` // websocket or sse
+	SSERate          string                                                            `opts:"name=sse-rate,short=-" help:"An optional limit on SSE uploads, in bytes per second (for example 64KB). Pacing keeps bulk uploads from standing out by their rate, at the cost of throughput. Only applies with --sse. Defaults to unlimited."`
+	ObfsKey          string                                                            `opts:"name=obfs-key,short=-" help:"An optional pre-shared key. When set, all tunnel traffic inside the websocket or SSE transport is encrypted with AES-256-GCM using a key derived from it, hiding the SSH handshake and packet structure from deep packet inspection. Client and server must use the same key; a mismatch fails the connection. (defaults to the CHISEL_OBFS_KEY environment variable)"`
 }
 
 // TLSConfig for a Client
@@ -55,6 +58,10 @@ type TLSConfig struct {
 	Key        string `opts:"name=tls-key,short=-" help:"a path to a PEM encoded private key used for client authentication (mutual-TLS)."`
 	ServerName string `opts:"-"`
 }
+
+// defaultUserAgent is sent unless --header sets one; Go's default
+// "Go-http-client/1.1" marks the traffic as non-browser
+const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
 
 // Client represents a client instance
 type Client struct {
@@ -69,6 +76,8 @@ type Client struct {
 	stop      func()
 	eg        *errgroup.Group
 	tunnel    *tunnel.Tunnel
+	obfsKey   []byte
+	sseRate   int64
 }
 
 // NewClient creates a new client instance
@@ -187,6 +196,23 @@ func NewClient(c *Config) (*Client, error) {
 		if err != nil {
 			return nil, fmt.Errorf("Invalid proxy URL (%s)", err)
 		}
+	}
+	//sse upload pacing
+	if c.SSERate != "" {
+		if client.sseRate, err = sizestr.Parse(c.SSERate); err != nil {
+			return nil, fmt.Errorf("Invalid --sse-rate %q: %s", c.SSERate, err)
+		}
+	}
+	//look like a browser unless told otherwise
+	if c.Headers == nil {
+		c.Headers = http.Header{}
+	}
+	if c.Headers.Get("User-Agent") == "" {
+		c.Headers.Set("User-Agent", defaultUserAgent)
+	}
+	//traffic encryption
+	if c.ObfsKey != "" {
+		client.obfsKey = cnet.NewObfsKey(c.ObfsKey)
 	}
 	//ssh auth and config
 	user, pass := settings.ParseAuth(c.Auth)

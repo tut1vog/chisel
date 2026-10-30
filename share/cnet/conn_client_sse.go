@@ -4,119 +4,187 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 )
 
-// maxSSEFrame bounds a single base64-encoded SSE data line. An SSH packet
-// (max ~32 KiB payload) inflates ~4/3 under base64, so this leaves generous
-// headroom over bufio.Scanner's 64 KiB default token limit.
+// maxSSEFrame bounds a single SSE data line. Events carry at most sseEventMax
+// raw bytes, so this leaves generous headroom over bufio.Scanner's 64 KiB
+// default token limit.
 const maxSSEFrame = 512 * 1024
 
-// SSESessionCookie names the cookie that correlates the client's POSTs with
-// its streaming GET, set by the server on the handshake response.
-const SSESessionCookie = "sid"
-
 // ClientSSEConn is a net.Conn over the chisel SSE transport. The server->client
-// direction is the long-lived GET response body (base64 "data:" frames); the
-// client->server direction is one POST per Write.
+// direction is the long-lived streaming response (JSON "data:" events); the
+// client->server direction is a series of JSON POSTs.
 //
-// Note: the SSH layer serializes writes, so every Write is one synchronous POST
-// and effective upstream throughput is ~one frame per round-trip. This is
-// inherent to the SSE transport and is most noticeable on high-latency links.
+// Writes are buffered and uploaded by a single background sender, one request
+// at a time, so bursts of SSH writes share a request instead of each costing
+// a round-trip.
 type ClientSSEConn struct {
 	sessionID string       // included on every POST to correlate the session
-	client    *http.Client // shared with the handshake GET (TLS/proxy/dialer honored)
+	client    *http.Client // shared with the handshake request (TLS/proxy/dialer honored)
 	url       string
 	headers   http.Header // client-supplied headers replayed on each POST
 	ctx       context.Context
 	cancel    context.CancelFunc
-	body      io.ReadCloser // the streaming GET body
+	body      io.ReadCloser // the streaming response body
 	scanner   *bufio.Scanner
-	buff      []byte // leftover bytes from a frame larger than the Read buffer
+	buff      []byte // leftover bytes from an event larger than the Read buffer
+	pacer     *Pacer
+
+	mu      sync.Mutex
+	cond    *sync.Cond
+	pending []byte // written but not yet uploaded
+	err     error  // set once the sender stops; returned by later Writes
 }
 
-// NewClientSSEConn wraps the streaming handshake response as a net.Conn. ctx
-// governs the lifetime of outbound POSTs and cancel is invoked by Close to abort
-// the in-flight streaming GET.
-func NewClientSSEConn(ctx context.Context, cancel context.CancelFunc, resp *http.Response, client *http.Client, headers http.Header, url, id string) net.Conn {
+// NewClientSSEConn wraps the streaming handshake response as a net.Conn,
+// reading the session id from its first event. ctx governs the lifetime of
+// uploads and cancel is invoked by Close to abort the streaming response.
+// rate limits upload bytes per second (0 is unlimited).
+func NewClientSSEConn(ctx context.Context, cancel context.CancelFunc, resp *http.Response, client *http.Client, headers http.Header, url string, rate int64) (net.Conn, error) {
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), maxSSEFrame)
-	return &ClientSSEConn{
-		sessionID: id,
-		client:    client,
-		url:       url,
-		headers:   headers,
-		ctx:       ctx,
-		cancel:    cancel,
-		body:      resp.Body,
-		scanner:   scanner,
+	c := &ClientSSEConn{
+		client:  client,
+		url:     url,
+		headers: headers,
+		ctx:     ctx,
+		cancel:  cancel,
+		body:    resp.Body,
+		scanner: scanner,
+		pacer:   NewPacer(rate),
 	}
+	c.cond = sync.NewCond(&c.mu)
+	ev, err := c.nextEvent()
+	if err != nil || ev.ID == "" {
+		return nil, fmt.Errorf("sse handshake failed: missing session id")
+	}
+	c.sessionID = ev.ID
+	go c.sendLoop()
+	return c, nil
+}
+
+// nextEvent returns the next "data:" event of the stream
+func (c *ClientSSEConn) nextEvent() (sseEvent, error) {
+	var ev sseEvent
+	for c.scanner.Scan() {
+		line, ok := strings.CutPrefix(c.scanner.Text(), "data:")
+		if !ok {
+			continue //blank separators, comments, other fields
+		}
+		if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &ev); err != nil {
+			return ev, err
+		}
+		return ev, nil
+	}
+	if err := c.scanner.Err(); err != nil {
+		return ev, err
+	}
+	return ev, io.EOF
 }
 
 func (c *ClientSSEConn) Read(dst []byte) (int, error) {
-	if len(c.buff) > 0 {
-		n := copy(dst, c.buff)
-		// If we copied everything, clear the buffer.
-		// If not, slice it to keep the remaining part.
-		if n < len(c.buff) {
-			c.buff = c.buff[n:]
-		} else {
-			c.buff = nil
+	for len(c.buff) == 0 {
+		ev, err := c.nextEvent()
+		if err != nil {
+			return 0, err
 		}
-		return n, nil
+		c.buff = ev.Content
 	}
-	for c.scanner.Scan() {
-		line := c.scanner.Text()
-		// skip newlines until we reach the next data: line
-		if strings.HasPrefix(line, "data:") {
-			payload := strings.TrimPrefix(line, "data:")
-			data, err := base64.StdEncoding.DecodeString(payload)
-			if err != nil {
-				return 0, err
-			}
-			n := copy(dst, data)
-			// If there is data left over, save it for the next Read.
-			if n < len(data) {
-				c.buff = data[n:]
-			}
-			return n, nil
-		}
-	}
-	if err := c.scanner.Err(); err != nil {
-		return 0, err
-	}
-	return 0, io.EOF
+	n := copy(dst, c.buff)
+	c.buff = c.buff[n:]
+	return n, nil
 }
 
+// Write queues b for upload. It blocks only while too much is already queued.
 func (c *ClientSSEConn) Write(b []byte) (int, error) {
-	req, err := http.NewRequestWithContext(c.ctx, "POST", c.url, bytes.NewReader(b))
-	if err != nil {
-		return 0, err
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for c.err == nil && len(c.pending) >= sseMaxPending {
+		c.cond.Wait()
 	}
-	applyHeaders(req, c.headers)
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.AddCookie(&http.Cookie{Name: SSESessionCookie, Value: c.sessionID})
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return 0, err
+	if c.err != nil {
+		return 0, c.err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return 0, fmt.Errorf("unexpected status: %d", resp.StatusCode)
-	}
+	c.pending = append(c.pending, b...)
+	c.cond.Broadcast()
 	return len(b), nil
 }
 
-func (c *ClientSSEConn) Close() error {
+// sendLoop uploads queued bytes until the conn fails or closes
+func (c *ClientSSEConn) sendLoop() {
+	for {
+		//no artificial delay: whatever is written while an upload is in
+		//flight joins the next one, so batching grows with the load
+		c.mu.Lock()
+		for c.err == nil && len(c.pending) == 0 {
+			c.cond.Wait()
+		}
+		if c.err != nil {
+			c.mu.Unlock()
+			return
+		}
+		n := min(len(c.pending), sseMaxBatch)
+		batch := bytes.Clone(c.pending[:n])
+		c.pending = append(c.pending[:0], c.pending[n:]...)
+		c.cond.Broadcast()
+		c.mu.Unlock()
+		c.pacer.Wait(len(batch))
+		if err := c.upload(batch); err != nil {
+			c.fail(err)
+			return
+		}
+	}
+}
+
+func (c *ClientSSEConn) upload(b []byte) error {
+	body, err := json.Marshal(SSERequest{ID: c.sessionID, Content: b})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(c.ctx, "POST", c.url, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	applyHeaders(req, c.headers)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return err
+	}
+	//drain so the keep-alive connection is reused
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status: %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// fail stops the sender and aborts the stream, so the SSH layer observes the
+// error on both directions and the client reconnects.
+func (c *ClientSSEConn) fail(err error) {
+	c.mu.Lock()
+	if c.err == nil {
+		c.err = err
+	}
+	c.cond.Broadcast()
+	c.mu.Unlock()
 	if c.cancel != nil {
 		c.cancel()
 	}
+}
+
+func (c *ClientSSEConn) Close() error {
+	c.fail(net.ErrClosed)
 	return c.body.Close()
 }
 

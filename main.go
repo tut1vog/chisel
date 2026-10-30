@@ -201,6 +201,9 @@ func (o *serverOptions) Run() error {
 	if config.KeySeed == "" {
 		config.KeySeed = settings.Env("KEY")
 	}
+	if config.ObfsKey == "" {
+		config.ObfsKey = settings.Env("OBFS_KEY")
+	}
 	if config.Auth == "" {
 		config.Auth = os.Getenv("AUTH")
 	}
@@ -316,7 +319,7 @@ type clientOptions struct {
 	Hostname string   `opts:"name=hostname,short=-" help:"Optionally set the 'Host' header (defaults to the host found in the server url)."`
 	SNI      string   `opts:"name=sni,short=-" help:"Override the ServerName when using TLS (defaults to the hostname)."`
 	PID      bool     `opts:"name=pid,short=-" help:"Generate pid file in current working directory"`
-	SSE      bool     `opts:"name=sse,short=-" help:"Use Server-Sent Events as the transport instead of WebSockets. The client streams the server-to-client direction over a long-lived \"GET <path>/sse\" response and sends each client-to-server frame as a separate \"POST <path>/sse\", where <path> is the server URL's path. This helps traverse proxies or gateways that do not allow WebSocket upgrades, at the cost of throughput (each upstream frame is one HTTP round-trip)."`
+	SSE      bool     `opts:"name=sse,short=-" help:"Use Server-Sent Events as the transport instead of WebSockets. The client opens a long-lived event stream with a JSON POST to the server URL's path (or /sse when it has none) and sends the client-to-server direction as batched JSON POSTs to the same path, shaped like a streaming JSON API. This helps traverse proxies or gateways that do not allow WebSocket upgrades, at the cost of throughput (uploads take one HTTP round-trip per batch)."`
 }
 
 func newClientOptions() *clientOptions {
@@ -337,6 +340,9 @@ func (o *clientOptions) Run() error {
 	//default auth
 	if config.Auth == "" {
 		config.Auth = os.Getenv("AUTH")
+	}
+	if config.ObfsKey == "" {
+		config.ObfsKey = settings.Env("OBFS_KEY")
 	}
 	//move hostname onto headers
 	if o.Hostname != "" {
