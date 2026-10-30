@@ -114,3 +114,21 @@ func TestVerifyFingerprint(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+//TestSSEURL verifies the SSE endpoint keeps the server's http(s) scheme
+//rather than the ws(s):// form the client stores internally
+func TestSSEURL(t *testing.T) {
+	for server, want := range map[string]string{
+		"https://example.com/api/events": "https://example.com:443/api/events",
+		"http://example.com":             "http://example.com:80/sse",
+		"example.com:8080/":              "http://example.com:8080/sse",
+	} {
+		c, err := NewClient(&Config{Server: server, Mode: "sse", Remotes: []string{"9000"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, err := c.sseURL(); err != nil || got != want {
+			t.Errorf("%s: got %q (%v), want %q", server, got, err, want)
+		}
+	}
+}

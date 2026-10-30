@@ -288,7 +288,14 @@ func (c *Client) Start(ctx context.Context) error {
 	if c.proxyURL != nil {
 		via = " via " + c.proxyURL.String()
 	}
-	c.Infof("Connecting to %s%s\n", c.server, via)
+	//log the URL actually requested: in SSE mode, not the ws(s):// form
+	server := c.server
+	if c.config.Mode == "sse" {
+		if u, err := c.sseURL(); err == nil {
+			server = u
+		}
+	}
+	c.Infof("Connecting to %s%s\n", server, via)
 	//connect to chisel server
 	eg.Go(func() error {
 		return c.connectionLoop(ctx)

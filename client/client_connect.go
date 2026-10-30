@@ -76,6 +76,25 @@ func (c *Client) connectionLoop(ctx context.Context) error {
 	}
 }
 
+// sseURL is the SSE endpoint: the server URL back on its http(s) scheme,
+// with its path, or /sse without one
+func (c *Client) sseURL() (string, error) {
+	u, err := url.Parse(c.server)
+	if err != nil {
+		return "", err
+	}
+	switch u.Scheme {
+	case "ws":
+		u.Scheme = "http"
+	case "wss":
+		u.Scheme = "https"
+	}
+	if u.Path == "" || u.Path == "/" {
+		u.Path = "/sse"
+	}
+	return u.String(), nil
+}
+
 // connectionOnce connects to the chisel server and blocks
 func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error) {
 	//already closed?
@@ -115,21 +134,10 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		}
 		conn = cnet.NewWebSocketConn(wsConn)
 	case "sse":
-		// The SSE endpoint is the server URL's path, or /sse without one
-		u, err := url.Parse(c.server)
+		sseURL, err := c.sseURL()
 		if err != nil {
 			return false, err
 		}
-		switch u.Scheme {
-		case "ws":
-			u.Scheme = "http"
-		case "wss":
-			u.Scheme = "https"
-		}
-		if u.Path == "" || u.Path == "/" {
-			u.Path = "/sse"
-		}
-		sseURL := u.String()
 		// Build one HTTP client that honors TLS, proxy and dialer config; it is
 		// shared by the stream request and every subsequent upload. Like Go's
 		// default client it offers HTTP/2 over TLS, so the stream and uploads
