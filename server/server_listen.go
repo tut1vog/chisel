@@ -91,9 +91,11 @@ func (s *Server) tlsKeyCert(key, cert string, ca string) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	//file based tls config using tls defaults
+	//file based tls config using tls defaults, offering HTTP/2 as
+	//http.Server.ListenAndServeTLS (and the LetsEncrypt config) would
 	c := &tls.Config{
 		Certificates: []tls.Certificate{keypair},
+		NextProtos:   []string{"h2", "http/1.1"},
 	}
 	//mTLS requires server's CA
 	if ca != "" {

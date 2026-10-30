@@ -127,7 +127,10 @@ func (s *Server) handleSSEStream(w http.ResponseWriter, req *http.Request) {
 	h := w.Header()
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
-	h.Set("Connection", "keep-alive")
+	if req.ProtoMajor == 1 {
+		//connection headers are not allowed in HTTP/2
+		h.Set("Connection", "keep-alive")
+	}
 	h.Set("X-Accel-Buffering", "no")
 	//uploads return the session id in this cookie
 	http.SetCookie(w, &http.Cookie{

@@ -131,10 +131,14 @@ func (c *Client) connectionOnce(ctx context.Context) (connected bool, err error)
 		}
 		sseURL := u.String()
 		// Build one HTTP client that honors TLS, proxy and dialer config; it is
-		// shared by the stream request and every subsequent upload.
+		// shared by the stream request and every subsequent upload. Like Go's
+		// default client it offers HTTP/2 over TLS, so the stream and uploads
+		// share one connection when the server agrees. (http2 edits the TLS
+		// config it is given, hence the clone.)
 		transport := &http.Transport{
-			TLSClientConfig: c.tlsConfig,
-			DialContext:     c.config.DialContext,
+			TLSClientConfig:   c.tlsConfig.Clone(),
+			DialContext:       c.config.DialContext,
+			ForceAttemptHTTP2: true,
 		}
 		if c.proxyURL != nil {
 			p, err := sseProxyURL(c.proxyURL)

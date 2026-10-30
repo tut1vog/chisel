@@ -59,10 +59,6 @@ type TLSConfig struct {
 	ServerName string `opts:"-"`
 }
 
-// defaultUserAgent is sent unless --header sets one; Go's default
-// "Go-http-client/1.1" marks the traffic as non-browser
-const defaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
-
 // Client represents a client instance
 type Client struct {
 	*cio.Logger
@@ -203,12 +199,10 @@ func NewClient(c *Config) (*Client, error) {
 			return nil, fmt.Errorf("Invalid --sse-rate %q: %s", c.SSERate, err)
 		}
 	}
-	//look like a browser unless told otherwise
+	//no User-Agent is set by default: Go's own matches its TLS handshake
+	//and header order, where a browser's would contradict them
 	if c.Headers == nil {
 		c.Headers = http.Header{}
-	}
-	if c.Headers.Get("User-Agent") == "" {
-		c.Headers.Set("User-Agent", defaultUserAgent)
 	}
 	//traffic encryption
 	if c.ObfsKey != "" {
