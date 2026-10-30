@@ -1,0 +1,115 @@
+name: Release SSE
+# ================
+# Every push to the fork's sse branch is tested and, if green, published as
+# a GitHub prerelease tagged v<upstream version>-sse.<run number>, e.g.
+# v1.13.0-sse.42. Kept separate from ci.yml so upstream merges into master
+# do not conflict with it. No Docker images: those publish to upstream's
+# registries.
+# ================
+on:
+  push:
+    branches: [sse]
+permissions:
+  contents: read
+concurrency:
+  group: release-sse
+  cancel-in-progress: false
+jobs:
+  test:
+    name: Build & Test
+    strategy:
+      matrix:
+        platform: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          check-latest: true
+      - name: Build
+        run: go build -v -o /dev/null .
+      - name: Test
+        run: go test -v ./...
+  release:
+    name: Release
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # the preflight must run without publication credentials
+          persist-credentials: false
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+      - name: Tag this build
+        # The fork carries no upstream release tags, so fetch them to find
+        # the version this branch is based on. The tag is created locally
+        # only; the publishing run creates it on GitHub at this commit.
+        run: |
+          set -euo pipefail
+          git fetch --no-tags https://github.com/jpillora/chisel.git '+refs/tags/v*:refs/tags/v*'
+          base="$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' HEAD)"
+          prev="$(git describe --tags --abbrev=0 --match 'v*-sse.*' HEAD 2>/dev/null || echo "$base")"
+          tag="${base}-sse.${GITHUB_RUN_NUMBER}"
+          if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+            echo "::error::$tag already exists (re-run of a published build?)"
+            exit 1
+          fi
+          git tag "$tag"
+          echo "releasing $tag (changes since $prev)"
+          echo "GORELEASER_CURRENT_TAG=$tag" >> "$GITHUB_ENV"
+          echo "GORELEASER_PREVIOUS_TAG=$prev" >> "$GITHUB_ENV"
+      - name: Build release archives without publishing
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          # keep in step with the pin in ci.yml (#610: corrupt .gz archives)
+          version: v2.17.0
+          args: release --clean --config .github/goreleaser-sse.yml --skip=publish,nfpm
+      - name: Verify and stage release archives
+        # Fail closed before credentials are used. The publishing run skips
+        # its archive pipe and uploads these exact files from outside dist.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(dist/*.gz dist/*.zip)
+          if (( ${#archives[@]} == 0 )); then
+            echo "::error::GoReleaser produced no .gz or .zip archives"
+            exit 1
+          fi
+
+          bad=0
+          for archive in "${archives[@]}"; do
+            case "$archive" in
+              *.gz)  gzip -t "$archive" || { echo "CORRUPT: $archive"; bad=1; } ;;
+              *.zip) unzip -t "$archive" >/dev/null || { echo "CORRUPT: $archive"; bad=1; } ;;
+            esac
+          done
+          if (( bad != 0 )); then
+            exit "$bad"
+          fi
+
+          mkdir -p release/archives
+          mv -- "${archives[@]}" release/archives/
+          echo "verified and staged ${#archives[@]} release archives"
+      - name: Publish with GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: v2.17.0
+          # Rebuild binaries for packages, but preserve the verified archives
+          # by skipping this run's archive pipe.
+          args: release --clean --config .github/goreleaser-sse.yml --skip=archive
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ARCHIVES_GLOB: release/archives/*

@@ -1,0 +1,78 @@
+# Release config for the fork's sse branch (see workflows/release-sse.yml).
+# Mirrors goreleaser.yml without the Docker images, which publish to
+# repositories this fork cannot push to, and publishes the release directly
+# instead of as a draft.
+#
+# test this file with
+#   goreleaser release --config .github/goreleaser-sse.yml --clean --snapshot
+version: 2
+builds:
+  - id: chisel
+    env:
+      - CGO_ENABLED=0
+    ldflags:
+      - -s -w -X github.com/jpillora/chisel/share.BuildVersion={{.Version}}
+    flags:
+      - -trimpath
+    goos:
+      - linux
+      - darwin
+      - windows
+      - openbsd
+    goarch:
+      - "386"
+      - amd64
+      - arm
+      - arm64
+      - ppc64
+      - ppc64le
+      - mips
+      - mipsle
+      - mips64
+      - mips64le
+      - s390x
+    goarm:
+      - "5"
+      - "6"
+      - "7"
+    gomips:
+      - hardfloat
+      - softfloat
+    ignore:
+      # https://github.com/golang/go/issues/70705
+      - goos: windows
+        goarch: arm
+nfpms:
+  - maintainer: "https://github.com/tut1vog"
+    formats:
+      - deb
+      - rpm
+      - apk
+archives:
+  - formats:
+      - gz
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - none*
+checksum:
+  # The publishing workflow stages preflight-verified archives outside dist,
+  # then sets this glob so the real release checksums those exact files.
+  extra_files:
+    - glob: '{{ envOrDefault "RELEASE_ARCHIVES_GLOB" "" }}'
+release:
+  # the tag only exists locally in CI; GitHub creates it at this commit
+  target_commitish: "{{ .FullCommit }}"
+  prerelease: auto
+  # In CI, these are the archives produced and checked by the non-publishing
+  # preflight. The publishing run uses --skip=archive, so it cannot replace
+  # them with rebuilt, unvalidated archives.
+  extra_files:
+    - glob: '{{ envOrDefault "RELEASE_ARCHIVES_GLOB" "" }}'
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
