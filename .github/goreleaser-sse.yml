@@ -1,7 +1,8 @@
 # Release config for the fork's sse branch (see workflows/release-sse.yml).
 # Mirrors goreleaser.yml without the Docker images, which publish to
 # repositories this fork cannot push to, and publishes the release directly
-# instead of as a draft.
+# instead of as a draft. Ships only common targets (linux, darwin amd64/arm64;
+# windows amd64) as plain archives, without .deb/.rpm/.apk packages.
 #
 # test this file with
 #   goreleaser release --config .github/goreleaser-sse.yml --clean --snapshot
@@ -14,40 +15,17 @@ builds:
       - -s -w -X github.com/jpillora/chisel/share.BuildVersion={{.Version}}
     flags:
       - -trimpath
+    # only the commonly used targets
     goos:
       - linux
       - darwin
       - windows
-      - openbsd
     goarch:
-      - "386"
       - amd64
-      - arm
       - arm64
-      - ppc64
-      - ppc64le
-      - mips
-      - mipsle
-      - mips64
-      - mips64le
-      - s390x
-    goarm:
-      - "5"
-      - "6"
-      - "7"
-    gomips:
-      - hardfloat
-      - softfloat
     ignore:
-      # https://github.com/golang/go/issues/70705
       - goos: windows
-        goarch: arm
-nfpms:
-  - maintainer: "https://github.com/tut1vog"
-    formats:
-      - deb
-      - rpm
-      - apk
+        goarch: arm64
 archives:
   - formats:
       - gz

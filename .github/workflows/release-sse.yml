@@ -75,7 +75,7 @@ jobs:
           distribution: goreleaser
           # keep in step with the pin in ci.yml (#610: corrupt .gz archives)
           version: v2.17.0
-          args: release --clean --config .github/goreleaser-sse.yml --skip=publish,nfpm
+          args: release --clean --config .github/goreleaser-sse.yml --skip=publish
       - name: Verify and stage release archives
         # Fail closed before credentials are used. The publishing run skips
         # its archive pipe and uploads these exact files from outside dist.
@@ -107,8 +107,7 @@ jobs:
         with:
           distribution: goreleaser
           version: v2.17.0
-          # Rebuild binaries for packages, but preserve the verified archives
-          # by skipping this run's archive pipe.
+          # Preserve the verified archives by skipping this run's archive pipe.
           args: release --clean --config .github/goreleaser-sse.yml --skip=archive
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
