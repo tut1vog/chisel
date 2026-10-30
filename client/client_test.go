@@ -3,8 +3,10 @@ package chclient
 import (
 	"context"
 	"crypto/elliptic"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -173,6 +175,84 @@ func TestRedactSetCookie(t *testing.T) {
 	} {
 		if got := redactSetCookie(in); got != want {
 			t.Errorf("%q: got %q, want %q", in, got, want)
+		}
+	}
+}
+
+//TestHostHeaderOmitsDefaultPort verifies the Host header names the default
+//port nowhere, like browsers and curl, in both transports. Dials go to local
+//test servers whatever the server URL, so default ports need no privileges.
+func TestHostHeaderOmitsDefaultPort(t *testing.T) {
+	hosts := make(chan string, 1)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case hosts <- r.Host:
+		default:
+		}
+		w.WriteHeader(http.StatusNotFound)
+	})
+	plain := httptest.NewServer(handler)
+	defer plain.Close()
+	tlsSrv := httptest.NewTLSServer(handler)
+	defer tlsSrv.Close()
+	for _, c := range []struct {
+		server, hostname, want string
+	}{
+		{"https://example.com", "", "example.com"},
+		{"https://example.com:443/api/events", "", "example.com"},
+		{"http://example.com", "", "example.com"},
+		{"example.com", "", "example.com"},
+		{"https://example.com:8443", "", "example.com:8443"},
+		{"http://example.com:443", "", "example.com:443"},
+		{"https://[::1]", "", "[::1]"},
+		{"https://example.com", "front.example.org", "front.example.org"},
+	} {
+		for _, mode := range []string{"websocket", "sse"} {
+			target := plain.Listener.Addr().String()
+			if strings.HasPrefix(c.server, "https") {
+				target = tlsSrv.Listener.Addr().String()
+			}
+			config := &Config{
+				Server:  c.server,
+				Mode:    mode,
+				Remotes: []string{"9000"},
+				DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					return (&net.Dialer{}).DialContext(ctx, network, target)
+				},
+			}
+			config.TLS.SkipVerify = true
+			if c.hostname != "" {
+				config.Headers = http.Header{"Host": {c.hostname}}
+			}
+			cl, err := NewClient(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cl.connectionOnce(context.Background())
+			select {
+			case got := <-hosts:
+				if got != c.want {
+					t.Errorf("%s %s: Host %q, want %q", mode, c.server, got, c.want)
+				}
+			default:
+				t.Errorf("%s %s: no request arrived", mode, c.server)
+			}
+		}
+	}
+}
+
+func TestHostWithoutDefaultPort(t *testing.T) {
+	for in, want := range map[string]string{
+		"wss://example.com:443":    "example.com",
+		"ws://example.com:80":      "example.com",
+		"wss://example.com:80":     "example.com:80",
+		"ws://example.com:8080":    "example.com:8080",
+		"wss://[2001:db8::1]:443":  "[2001:db8::1]",
+		"wss://[2001:db8::1]:8443": "[2001:db8::1]:8443",
+	} {
+		u, _ := url.Parse(in)
+		if got := hostWithoutDefaultPort(u); got != want {
+			t.Errorf("%s: got %q, want %q", in, got, want)
 		}
 	}
 }

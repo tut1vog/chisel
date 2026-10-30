@@ -204,6 +204,11 @@ func NewClient(c *Config) (*Client, error) {
 	if c.Headers == nil {
 		c.Headers = http.Header{}
 	}
+	//like browsers and curl, name the default port nowhere on the wire: the
+	//default port appended above would otherwise reach the Host header
+	if c.Headers.Get("Host") == "" {
+		c.Headers.Set("Host", hostWithoutDefaultPort(u))
+	}
 	//traffic encryption
 	if c.ObfsKey != "" {
 		client.obfsKey = cnet.NewObfsKey(c.ObfsKey)
@@ -278,6 +283,22 @@ func (c *Client) verifyLegacyFingerprint(key ssh.PublicKey) error {
 	return nil
 }
 
+// hostWithoutDefaultPort returns u's host, dropping the port when it is the
+// scheme's default (443 for https/wss, 80 for http/ws)
+func hostWithoutDefaultPort(u *url.URL) string {
+	port := u.Port()
+	switch {
+	case port == "443" && (u.Scheme == "https" || u.Scheme == "wss"),
+		port == "80" && (u.Scheme == "http" || u.Scheme == "ws"):
+	default:
+		return u.Host
+	}
+	if host := u.Hostname(); strings.Contains(host, ":") {
+		return "[" + host + "]" //IPv6 literal
+	}
+	return u.Hostname()
+}
+
 // Start client and does not block
 func (c *Client) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
@@ -294,6 +315,10 @@ func (c *Client) Start(ctx context.Context) error {
 		if u, err := c.sseURL(); err == nil {
 			server = u
 		}
+	}
+	if u, err := url.Parse(server); err == nil {
+		u.Host = hostWithoutDefaultPort(u)
+		server = u.String()
 	}
 	c.Infof("Connecting to %s%s\n", server, via)
 	//connect to chisel server
